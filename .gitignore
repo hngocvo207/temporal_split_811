@@ -1,0 +1,51 @@
+# Local environments and IDEs
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Python caches
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Local env files
+.env
+.env.*
+
+# Logs and experiment artifacts
+*.log
+logs/
+**/logs/
+scratch_logs/
+**/scratch_logs/
+dynamic_fusion_leakage_audit/scratch_logs/
+wandb/
+**/wandb/
+
+# Model checkpoints and serialized artifacts
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.model
+*.pkl
+*.pickle
+*.npz
+*.npy
+
+# Large generated datasets / preprocessing outputs
+data/preprocessed/
+Dynamic_Fusion/data/preprocessed/
+Dynamic_Fusion/Dataset/output/
+Dynamic_Fusion/Dataset/bi_model/output/
+Dynamic_Fusion/raw_data/**/*_1000K.csv
+Dynamic_Fusion/raw_data/MulDiGraph/*.pkl
+dynamic_fusion_leakage_audit/scratch_logs/
+
+# Archive / bundle outputs
+*.zip
+*.tar
+*.gz
+*.bz2
+*.xz
