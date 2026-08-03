@@ -1,0 +1,26 @@
+# Local environments and IDE
+.venv/
+venv/
+.idea/
+
+# Python caches
+__pycache__/
+**/__pycache__/
+*.pyc
+# Local env file
+.env
+# Generated logs/artifacts
+*.log
+wandb/
+Dataset/wandb/
+output/
+Dataset/output/
+# Preprocessed data (do not version)
+data/preprocessed/
+# Heavy data/model artifacts
+*.pt
+*.pkl
+raw_data/**/*_1000K.csv
+]633;E;{    echo 'raw_data/B4E/phisher_transaction_in.csv'\x3b   echo 'raw_data/B4E/phisher_transaction_out.csv'\x3b } >> .gitignore;57ee1235-203f-4036-8ad6-e1ae52887fd0]633;Craw_data/B4E/phisher_transaction_in.csv
+raw_data/B4E/phisher_transaction_out.csv
+raw_data/B4E/phisher_transaction_in.csv
