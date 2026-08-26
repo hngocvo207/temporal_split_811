@@ -1,0 +1,32 @@
+{
+  "num_nodes": 2973489,
+  "num_features": 23,
+  "feature_columns": [
+    "out_degree",
+    "in_degree",
+    "direction_ratio",
+    "max_out_amount",
+    "min_out_amount",
+    "avg_out_amount",
+    "max_in_amount",
+    "min_in_amount",
+    "avg_in_amount",
+    "account_balance",
+    "lifetime_days",
+    "active_days",
+    "freq_out_short",
+    "freq_in_short",
+    "freq_out_long",
+    "freq_in_long",
+    "short_long_out_ratio",
+    "short_long_in_ratio",
+    "betweenness_centrality",
+    "degree_centrality",
+    "clustering_coefficient",
+    "in_degree_centrality",
+    "out_degree_centrality"
+  ],
+  "source_csv": "raw_data/MulDiGraph/features_output_all23_MG_fullscale.csv",
+  "index_map_source": "data/preprocessed/Dataset_MG/address_to_index.pkl",
+  "index_convention": "row i of node_features_all23.pt corresponds to the account whose address_to_index.pkl value is i -- same index space as adj_train.npz / adj_inference.npz / labels.pkl / partition.pkl."
+}

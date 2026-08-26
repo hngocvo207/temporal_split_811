@@ -54,6 +54,19 @@ parser.add_argument("--model", type=str, default="ETH_GBert")
 parser.add_argument("--patience", type=int, default=5)
 parser.add_argument("--validate_program", action="store_true")
 parser.add_argument("--max_epochs", type=int, default=None)
+parser.add_argument(
+    "--warmup_ratio", type=float, default=0.1,
+    help="BertAdam warmup proportion. This model already used BertAdam (unlike tri_model, which "
+         "briefly switched to Adam+CosineAnnealingLR with no warmup and got stuck selecting epoch 0 "
+         "as best on the new T_cutoff split -- see preprocessing_and_eval_report.md §11 Attempt "
+         "1/2/3). Exposed as a flag here for parity/tunability; default 0.1 matches Attempt 3.",
+)
+parser.add_argument(
+    "--run_tag", type=str, default="",
+    help="Optional free-text tag folded into the checkpoint filename (alongside the auto-detected "
+         "vocab size) to disambiguate runs that share every other naming input but aren't "
+         "checkpoint-compatible -- see report §14/§15 item 6.",
+)
 args = parser.parse_args()
 
 # Initialize WandB (credentials come from `wandb login`, stored in ~/.netrc — never hardcode the key here)
@@ -72,7 +85,11 @@ total_train_epochs = 50
 dropout_rate = 0.2
 if args.ds in ("Dataset", "Dataset_MG"):
     batch_size = 8  # Reduced from 16 to prevent OOM
-    learning_rate0 = 8e-6
+    # learning_rate0 previously hardcoded to 8e-6 here regardless of --lr --
+    # respect --lr instead (see tri_model/train1.py's identical fix, report §11
+    # change 4). This model already used BertAdam+warmup (never migrated to
+    # Adam+Cosine), so it didn't need the "stuck at epoch 0" fix tri_model
+    # needed -- but the hardcoded-LR bug was the same bug either way.
     l2_decay = 0.001
 MAX_SEQ_LENGTH = 400 + gcn_embedding_dim
 gradient_accumulation_steps = 1
@@ -84,61 +101,32 @@ if env_config.TRANSFORMERS_OFFLINE == 1:
         f"hf-maintainers_{bert_model_scale}",
     )
 do_lower_case = True
-warmup_proportion = 0.1
+warmup_proportion = args.warmup_ratio
 BASE_DIR = os.path.dirname(_DATASET_DIR)
 data_dir = os.path.join(BASE_DIR, "data/preprocessed/multi_processed_data_MG")
-output_dir = "./output/"
+# Anchored to this script's own directory, NOT the launch cwd -- "./output/"
+# previously resolved wherever the process happened to be started from, which
+# let this script's checkpoints land in and silently overwrite
+# tri_model/train1.py's identically-named-formula checkpoints (see
+# preprocessing_and_eval_report.md / full_scale_test_eval_report.md: tri-modal's
+# Attempt-3 checkpoint was lost this way).
+output_dir = os.path.join(_THIS_DIR, "output")
 if not os.path.exists(output_dir):
     os.mkdir(output_dir)
-perform_metrics_str = ["weighted avg", "f1-score"]
+perform_metrics_str = "F1(pos)"  # model-selection / early-stopping criterion (validation set) --
+# was weighted-avg F1-score; switched for the same reason as tri_model/train1.py (report §11 change
+# 2): weighted F1 on a ~97%+-majority-class validation set rewards trivially-classifying-benign over
+# actual phishing-detection quality. Still computed and reported alongside for comparability.
 classifier_act_func = nn.ReLU()
 resample_train_set = False
 do_softmax_before_mse = True
 cfg_loss_criterion = "cle"
-model_file_4save = (
-    f"{cfg_model_type}{gcn_embedding_dim}_model_{args.ds}_{cfg_loss_criterion}"
-    f"_sw{int(cfg_stop_words)}.pt"
-)
-resume_ckpt_path = os.path.join(output_dir, model_file_4save.replace(".pt", "_resume.pt"))
 CHECKPOINT_EVERY_N_STEPS = 250
-
-# If a resume checkpoint from a previous (possibly abruptly-stopped) run exists
-# and --load 1 was passed, keep logging into the SAME WandB run instead of
-# starting a new one every restart.
-_early_resume_ckpt = None
-if will_train_mode_from_checkpoint and os.path.exists(resume_ckpt_path):
-    # weights_only=False: this checkpoint is our own (self-generated, local,
-    # trusted) and includes BertAdam's optimizer state, which contains a
-    # WarmupLinearSchedule object -- not on torch's default safe-globals list.
-    _early_resume_ckpt = torch.load(resume_ckpt_path, map_location="cpu", weights_only=False)
-    wandb_run_id = _early_resume_ckpt.get("wandb_run_id") or wandb.util.generate_id()
-else:
-    wandb_run_id = wandb.util.generate_id()
-
-wandb.init(project="fraud_detection", config=args, id=wandb_run_id, resume="allow")
 
 if args.validate_program:
     total_train_epochs = 1
 if args.max_epochs is not None:
     total_train_epochs = args.max_epochs
-
-print(cfg_model_type + " (BI-MODAL: BERT+GCN, no graph features) Start at:", time.asctime())
-print(
-    "\n----- Configure -----",
-    f"\n  args.ds: {args.ds}",
-    f"\n  stop_words: {cfg_stop_words}",
-    f"\n  Vocab GCN_hidden_dim: vocab_size -> 128 -> {str(gcn_embedding_dim)}",
-    f"\n  Learning_rate0: {learning_rate0}\n  weight_decay: {l2_decay}",
-    f"\n  Loss_criterion {cfg_loss_criterion}",
-    f"\n  softmax_before_mse: {do_softmax_before_mse}",
-    f"\n  Dropout: {dropout_rate}",
-    f"\n  gcn_act_func: Relu",
-    f"\n  MAX_SEQ_LENGTH: {MAX_SEQ_LENGTH}",
-    f"\n  perform_metrics_str: {perform_metrics_str}",
-    f"\n  model_file_4save: {model_file_4save}",
-    f"\n  early_stopping_patience: {args.patience}",
-    f"\n  validate_program: {args.validate_program}",
-)
 
 
 """
@@ -200,6 +188,54 @@ train_size = len(train_y)
 valid_size = len(valid_y)
 test_size = len(test_y)
 
+# Checkpoint filename built here, AFTER gcn_vocab_size is known (not up in the
+# config block) -- see tri_model/train1.py's identical fix, report §14/§15
+# item 6: two runs started with different --cap_* sizes now get different
+# filenames instead of silently colliding on a size-mismatched tensor.
+# --run_tag adds a manual disambiguator for cases vocab size alone can't catch.
+model_file_4save = (
+    f"{cfg_model_type}{gcn_embedding_dim}_model_{args.ds}_{cfg_loss_criterion}"
+    f"_sw{int(cfg_stop_words)}_vocab{gcn_vocab_size}"
+    + (f"_{args.run_tag}" if args.run_tag else "")
+    + ".pt"
+)
+resume_ckpt_path = os.path.join(output_dir, model_file_4save.replace(".pt", "_resume.pt"))
+
+# If a resume checkpoint from a previous (possibly abruptly-stopped) run exists
+# and --load 1 was passed, keep logging into the SAME WandB run instead of
+# starting a new one every restart.
+_early_resume_ckpt = None
+if will_train_mode_from_checkpoint and os.path.exists(resume_ckpt_path):
+    # weights_only=False: this checkpoint is our own (self-generated, local,
+    # trusted) and includes BertAdam's optimizer state, which contains a
+    # WarmupLinearSchedule object -- not on torch's default safe-globals list.
+    _early_resume_ckpt = torch.load(resume_ckpt_path, map_location="cpu", weights_only=False)
+    wandb_run_id = _early_resume_ckpt.get("wandb_run_id") or wandb.util.generate_id()
+else:
+    wandb_run_id = wandb.util.generate_id()
+
+wandb.init(project="fraud_detection", config=args, id=wandb_run_id, resume="allow")
+
+print(cfg_model_type + " (BI-MODAL: BERT+GCN, no graph features) Start at:", time.asctime())
+print(
+    "\n----- Configure -----",
+    f"\n  args.ds: {args.ds}",
+    f"\n  stop_words: {cfg_stop_words}",
+    f"\n  Vocab GCN_hidden_dim: vocab_size ({gcn_vocab_size}) -> 128 -> {str(gcn_embedding_dim)}",
+    f"\n  Learning_rate0: {learning_rate0}\n  weight_decay: {l2_decay}",
+    f"\n  Loss_criterion {cfg_loss_criterion}",
+    f"\n  softmax_before_mse: {do_softmax_before_mse}",
+    f"\n  Dropout: {dropout_rate}",
+    f"\n  gcn_act_func: Relu",
+    f"\n  MAX_SEQ_LENGTH: {MAX_SEQ_LENGTH}",
+    f"\n  perform_metrics_str: {perform_metrics_str}",
+    f"\n  warmup_ratio: {warmup_proportion}",
+    f"\n  run_tag: {args.run_tag or '(none)'}",
+    f"\n  model_file_4save: {model_file_4save}",
+    f"\n  early_stopping_patience: {args.patience}",
+    f"\n  validate_program: {args.validate_program}",
+)
+
 # Doc order is train+valid+test -- positional slicing by count is still correct
 # for separating the three example sets; only each example's guid needed fixing.
 indexs = np.arange(0, len(examples))
@@ -240,17 +276,23 @@ train_classes_num, train_classes_weight = get_class_count_and_weight(
 loss_weight = torch.tensor(train_classes_weight, dtype=torch.float).to(device)
 
 # Imbalance handling for TRAIN loss only (val/test loaders and example
-# composition are untouched). alpha is derived from TRAIN class frequency
-# only, gamma=2.
+# composition are untouched). gamma=2.
+#
+# alpha is NEUTRAL (0.5/0.5), not derived from TRAIN class frequency. This
+# model's train_dataloader now uses WeightedRandomSampler (below) to rebalance
+# batches; a class-frequency alpha on TOP of that double-corrects for the same
+# imbalance -- exactly the bug tri_model/train1.py hit (report §11 "Attempt 1"):
+# alpha=[0.026, 0.974] stacked on an already-~50/50-resampled batch collapsed
+# the model to predicting the positive class almost every time. Pick ONE
+# rebalancing mechanism (the sampler), not two.
 cfg_use_focal_loss = True
 focal_gamma = 2.0
 train_pos_frac = float(np.mean(train_y)) if len(train_y) else 0.5
-focal_alpha = torch.tensor(
-    [train_pos_frac, 1.0 - train_pos_frac], dtype=torch.float
-).to(device)  # weight the MINORITY class higher -> alpha[0]=P(y=1), alpha[1]=P(y=0)
+focal_alpha = torch.tensor([0.5, 0.5], dtype=torch.float).to(device)
 print(
     f"  Focal loss: enabled={cfg_use_focal_loss} gamma={focal_gamma} "
-    f"alpha={focal_alpha.tolist()} (from TRAIN class freq only, pos_frac={train_pos_frac:.4f})"
+    f"alpha={focal_alpha.tolist()} (neutral -- train_dataloader's WeightedRandomSampler already "
+    f"rebalances batches; original train pos_frac={train_pos_frac:.4f} kept for logging only)"
 )
 
 
@@ -308,16 +350,15 @@ def get_pytorch_dataloader(
             collate_fn=ds.pad,
         )
     elif shuffle_choice == 2:
+        # In-batch class balancing (report §7/§11): at this task's imbalance
+        # ratio and batch_size=8, plain shuffling gives ~0.2 expected positive
+        # examples per batch, i.e. most batches contain zero phishing examples.
+        # Read `label` straight off each InputExample (`examples`, not `ds`) --
+        # indexing through `ds` would re-run tokenization per example just to
+        # read a label already sitting on the InputExample object.
         assert classes_weight is not None
         assert total_resample_size > 0
-        weights = [
-            classes_weight[0]
-            if label == 0
-            else classes_weight[1]
-            if label == 1
-            else classes_weight[2]
-            for _, _, _, _, label, _ in ds
-        ]
+        weights = [classes_weight[ex.label] for ex in examples]
         sampler = WeightedRandomSampler(
             weights, num_samples=total_resample_size, replacement=True
         )
@@ -337,7 +378,8 @@ if args.validate_program:
     test_partition = [test_partition[0]]
 
 train_dataloader = get_pytorch_dataloader(
-    train_examples, tokenizer, batch_size, shuffle_choice=1
+    train_examples, tokenizer, batch_size, shuffle_choice=2,
+    classes_weight=train_classes_weight, total_resample_size=len(train_examples),
 )
 valid_dataloader = get_pytorch_dataloader(
     valid_examples, tokenizer, batch_size, shuffle_choice=0
@@ -388,11 +430,11 @@ def evaluate(
                 segment_ids,
                 y_prob,
                 label_ids,
-                gcn_swop_eye,
+                gcn_vocab_ids,
             ) = batch
 
             logits = model(
-                gcn_adj_list, gcn_swop_eye, input_ids, segment_ids, input_mask
+                gcn_adj_list, gcn_vocab_ids, input_ids, segment_ids, input_mask
             )
 
             loss = compute_loss(logits, label_ids, y_prob, is_training=False)
@@ -413,7 +455,12 @@ def evaluate(
 
         y_true_arr = np.array(all_label_ids).reshape(-1)
         y_pred_arr = np.array(predict_out).reshape(-1)
-        f1_metrics = f1_score(y_true_arr, y_pred_arr, average="weighted")
+        # Report BOTH: F1(weighted) is kept for comparability but under heavy
+        # class imbalance is dominated by the trivially-easy majority/benign
+        # class; F1(pos) (positive-class-only) is what drives model
+        # selection/early stopping below -- see report §11 change 2/3.
+        f1_weighted = f1_score(y_true_arr, y_pred_arr, average="weighted")
+        f1_pos = f1_score(y_true_arr, y_pred_arr, pos_label=1, zero_division=0)
         pre = precision_score(y_true_arr, y_pred_arr, average="weighted")
         rec = recall_score(y_true_arr, y_pred_arr, average="weighted")
         print("Report:\n" + classification_report(y_true_arr, y_pred_arr, digits=4))
@@ -421,11 +468,11 @@ def evaluate(
     ev_acc = correct / total
     end = time.time()
     print(
-        "Epoch : %d, %s: %.3f, Pre: %.3f, Rec: %.3f, Acc : %.3f on %s, Spend:%.3f minutes for evaluation"
+        "Epoch : %d, F1(pos): %.3f, F1(weighted): %.3f, Pre: %.3f, Rec: %.3f, Acc : %.3f on %s, Spend:%.3f minutes for evaluation"
         % (
             epoch_th,
-            " ".join(perform_metrics_str),
-            100 * f1_metrics,
+            100 * f1_pos,
+            100 * f1_weighted,
             100 * pre,
             100 * rec,
             100.0 * ev_acc,
@@ -434,7 +481,7 @@ def evaluate(
         )
     )
     print("--------------------------------------------------------------")
-    return ev_loss, ev_acc, f1_metrics, pre, rec, y_true_arr, y_pred_arr, np.array(pos_probs)
+    return ev_loss, ev_acc, f1_weighted, f1_pos, pre, rec, y_true_arr, y_pred_arr, np.array(pos_probs)
 
 
 print("\n----- Running training -----")
@@ -457,6 +504,7 @@ if will_train_mode_from_checkpoint and _early_resume_ckpt is not None:
     epochs_without_improvement = checkpoint["epochs_without_improvement"]
     valid_f1_best_epoch = checkpoint["valid_f1_best_epoch"]
     test_f1_when_valid_best = checkpoint["test_f1_when_valid_best"]
+    test_f1_weighted_when_valid_best = checkpoint.get("test_f1_weighted_when_valid_best", 0.0)
     test_recall_when_valid_best = checkpoint["test_recall_when_valid_best"]
     test_precision_when_valid_best = checkpoint["test_precision_when_valid_best"]
     global_step_th_resumed = checkpoint["global_step_th"]
@@ -472,7 +520,7 @@ if will_train_mode_from_checkpoint and _early_resume_ckpt is not None:
     print(
         f"Resumed from {resume_ckpt_path}",
         f", epoch: {checkpoint['epoch']}, step: {checkpoint['step']}",
-        f", best valid {' '.join(perform_metrics_str)} so far: {perform_metrics_prev}",
+        f", best valid {perform_metrics_str} so far: {perform_metrics_prev}",
     )
 
 elif will_train_mode_from_checkpoint and os.path.exists(os.path.join(output_dir, model_file_4save)):
@@ -487,6 +535,7 @@ elif will_train_mode_from_checkpoint and os.path.exists(os.path.join(output_dir,
     epochs_without_improvement = 0
     valid_f1_best_epoch = checkpoint["epoch"]
     test_f1_when_valid_best = 0.0
+    test_f1_weighted_when_valid_best = 0.0
     test_recall_when_valid_best = 0.0
     test_precision_when_valid_best = 0.0
     model = ETH_GBertModel.from_pretrained(
@@ -509,6 +558,7 @@ else:
     epochs_without_improvement = 0
     valid_f1_best_epoch = -1
     test_f1_when_valid_best = 0.0
+    test_f1_weighted_when_valid_best = 0.0
     test_recall_when_valid_best = 0.0
     test_precision_when_valid_best = 0.0
     model = ETH_GBertModel.from_pretrained(
@@ -549,6 +599,7 @@ def save_resume_checkpoint(epoch_th, step_th):
             "epochs_without_improvement": epochs_without_improvement,
             "valid_f1_best_epoch": valid_f1_best_epoch,
             "test_f1_when_valid_best": test_f1_when_valid_best,
+            "test_f1_weighted_when_valid_best": test_f1_weighted_when_valid_best,
             "test_recall_when_valid_best": test_recall_when_valid_best,
             "test_precision_when_valid_best": test_precision_when_valid_best,
             "global_step_th": global_step_th,
@@ -594,11 +645,11 @@ for epoch in range(start_epoch, total_train_epochs):
             segment_ids,
             y_prob,
             label_ids,
-            gcn_swop_eye,
+            gcn_vocab_ids,
         ) = batch
 
         logits = model(
-            gcn_adj_list_train, gcn_swop_eye, input_ids, segment_ids, input_mask
+            gcn_adj_list_train, gcn_vocab_ids, input_ids, segment_ids, input_mask
         )
 
         loss = compute_loss(logits, label_ids, y_prob, is_training=True)
@@ -635,30 +686,36 @@ for epoch in range(start_epoch, total_train_epochs):
 
     print("--------------------------------------------------------------")
 
-    valid_loss, valid_acc, perform_metrics, valid_recall, valid_precision, _, _, _ = evaluate(
+    valid_loss, valid_acc, valid_f1_weighted, valid_f1_pos, valid_recall, valid_precision, _, _, _ = evaluate(
          model, gcn_adj_list_eval, valid_dataloader, batch_size, epoch, "Valid_set"
     )
-    test_loss, test_acc, test_f1, test_recall, test_precision, _, _, _ = evaluate(
+    test_loss, test_acc, test_f1_weighted, test_f1_pos, test_recall, test_precision, _, _, _ = evaluate(
          model, gcn_adj_list_eval, test_dataloader, batch_size, epoch, "Test_set"
     )
+    # Model selection / early stopping driven by F1(pos), not weighted F1 --
+    # see evaluate()'s comment / report §11 for why weighted F1 is misleading
+    # under this task's imbalance.
+    perform_metrics = valid_f1_pos
 
     all_loss_list["train"].append(tr_loss)
     all_loss_list["valid"].append(valid_loss)
     all_loss_list["test"].append(test_loss)
     all_f1_list["valid"].append(perform_metrics)
-    all_f1_list["test"].append(test_f1)
+    all_f1_list["test"].append(test_f1_pos)
 
     # Log metrics to WandB
     wandb.log({
         "epoch": epoch,
         "train_loss": tr_loss,
         "valid_loss": valid_loss,
-        "valid_f1": perform_metrics,
+        "valid_f1_pos": valid_f1_pos,
+        "valid_f1_weighted": valid_f1_weighted,
         "valid_recall": valid_recall,
         "valid_precision": valid_precision,
         "test_loss": test_loss,
         "test_acc": test_acc,
-        "test_f1": test_f1,
+        "test_f1_pos": test_f1_pos,
+        "test_f1_weighted": test_f1_weighted,
         "test_recall": test_recall,
         "test_precision": test_precision
     })
@@ -686,13 +743,14 @@ for epoch in range(start_epoch, total_train_epochs):
         torch.save(to_save, os.path.join(output_dir, model_file_4save))
 
         perform_metrics_prev = perform_metrics
-        test_f1_when_valid_best = test_f1
+        test_f1_when_valid_best = test_f1_pos
+        test_f1_weighted_when_valid_best = test_f1_weighted
         test_recall_when_valid_best = test_recall
         test_precision_when_valid_best = test_precision
         valid_f1_best_epoch = epoch
         epochs_without_improvement = 0
 
-        print(f"New best model saved at epoch {epoch} with F1: {perform_metrics:.4f}, Recall: {valid_recall:.4f}, Precision: {valid_precision:.4f}")
+        print(f"New best model saved at epoch {epoch} with F1(pos): {perform_metrics:.4f} (F1(weighted): {valid_f1_weighted:.4f}), Recall: {valid_recall:.4f}, Precision: {valid_precision:.4f}")
     else:
         epochs_without_improvement += 1
         print(
@@ -717,12 +775,13 @@ print(
     (time.time() - train_start) / 60.0,
 )
 print(
-    "**Valid weighted F1: %.3f at %d epoch."
+    "**Valid F1(pos): %.3f at %d epoch."
     % (100 * perform_metrics_prev, valid_f1_best_epoch)
 )
 print(
-    "**Test weighted F1 when valid best: %.3f, Recall: %.3f, Precision: %.3f"
-    % (100 * test_f1_when_valid_best, 100 * test_recall_when_valid_best, 100 * test_precision_when_valid_best)
+    "**Test F1(pos) when valid best: %.3f (F1(weighted): %.3f), Recall: %.3f, Precision: %.3f"
+    % (100 * test_f1_when_valid_best, 100 * test_f1_weighted_when_valid_best,
+       100 * test_recall_when_valid_best, 100 * test_precision_when_valid_best)
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -739,12 +798,12 @@ best_ckpt_path = os.path.join(output_dir, model_file_4save)
 if os.path.exists(best_ckpt_path):
     ckpt = torch.load(best_ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
-    print(f"  Reloaded best checkpoint (epoch {ckpt['epoch']}, valid F1 {ckpt['perform_metrics']:.4f}) for final scoring.")
+    print(f"  Reloaded best checkpoint (epoch {ckpt['epoch']}, valid F1(pos) {ckpt['perform_metrics']:.4f}) for final scoring.")
 else:
     print("  [!] No checkpoint saved (validate_program smoke run?) -- scoring current in-memory weights.")
 
 # Step 5: calibrate on VALIDATION only, never on test.
-_, _, _, _, _, valid_y_true, _, valid_pos_probs = evaluate(
+_, _, _, _, _, _, valid_y_true, _, valid_pos_probs = evaluate(
     model, gcn_adj_list_eval, valid_dataloader, batch_size, -1, "Valid_set(calibration)"
 )
 precisions, recalls, thresholds = precision_recall_curve(valid_y_true, valid_pos_probs)
@@ -753,10 +812,10 @@ f1s = np.where(
 )
 best_idx = int(np.argmax(f1s[:-1])) if len(thresholds) else None
 calibrated_threshold = float(thresholds[best_idx]) if best_idx is not None else 0.5
-print(f"  Calibrated threshold (val, argmax F1): {calibrated_threshold:.4f}  (val F1 at this point: {f1s[best_idx]:.4f})")
+print(f"  Calibrated threshold (val, argmax F1): {calibrated_threshold:.4f}  (val F1(pos) at this point: {f1s[best_idx]:.4f})")
 
 # Step 6: score TEST with the calibrated threshold (NOT 0.5 / NOT argmax).
-_, _, _, _, _, test_y_true, test_y_pred, test_pos_probs = evaluate(
+_, _, _, _, _, _, test_y_true, test_y_pred, test_pos_probs = evaluate(
     model, gcn_adj_list_eval, test_dataloader, batch_size, -1, "Test_set(final,calibrated)",
     threshold=calibrated_threshold,
 )

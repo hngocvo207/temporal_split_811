@@ -55,6 +55,74 @@ accordingly. In the course of chasing this down, two factual errors from the pre
 also caught and corrected in §11: Attempt 2 actually ran `--max_epochs 15` (not 6), and its corpus vocab
 is `35,000` (not `5,400`, which is §9's smaller 3,000-train corpus's vocab size, a different run).
 
+**Revision note (expanded-test propagation + Attempt 3 retrain, follow-up session):** a second,
+separate propagation approach was added and run end-to-end — new §17. Unlike `mg_propagate_labels.py`
+above (train-only, hub-guarded, soft-weighted, asserted disjoint from val/test),
+`Dataset/mg_propagate_labels_expanded_test.py` propagates 1-hop from the same 1,165 verified seeds
+**with no hub guard and no partition restriction**, deliberately letting propagated accounts land in
+val/test too — done on request, specifically to grow the sparse real test set (529 phishing) for
+evaluation. Full graph run: **7,007** newly labeled accounts, total labeled-fraud pool 1,165 → 8,172;
+test-partition fraud count 529 → 4,168. The Attempt 3 training config (§11: BertAdam, lr=2e-5,
+warmup_ratio=0.1, weighted sampler, neutral focal alpha, F1(pos) selection) was re-run on this expanded
+label set at the same 20,000/5,000×3 bounded scale as the original Attempt 3, in a fully isolated
+folder (`Dynamic_Fusion/runs/expanded_test_attempt3/`) to avoid checkpoint collision with the existing
+`..._attempt3v2.pt` checkpoint. Result: **test F1(pos) overall = 0.8763** — **not comparable** to
+Attempt 3's 0.6227, because this run's test set has a 41.68% positive rate (heavily enriched by
+propagation) instead of the original ~5.29%, a much easier statistical task. See §17 for the full
+breakdown and why the two numbers must not be read as "improvement."
+
+**Revision note (full-scale evaluation of the expanded-test checkpoint, same follow-up session):**
+§17's bounded-scale (20,000/5,000×3) checkpoint was then run through the same evaluation-only,
+full-811,704-account protocol as `full_scale_test_eval_report.md` — new §17.6. `mg_build_full_test_eval.py`
+and `eval_full_test.py` were extended (backward-compatible new flags) to build/score against an
+arbitrary checkpoint's own vocab and, when a non-strict `--labels_source` was used to build the
+corpus, to score the **same predictions against both label sets** (`isp_expanded` and strict `isp`) with
+independently val-calibrated thresholds for each. Headline, scored against **strict ground-truth `isp`**
+(directly comparable to `full_scale_test_eval_report.md` §4's 0.0549): this checkpoint gets **F1(pos)
+overall = 0.0383** — *worse*, not better, than the original Attempt 3 checkpoint at full scale. Full
+detail and interpretation in §17.6.
+
+**Revision note (full-scale feature extraction + a defect that affects every number in this
+document, follow-up session):** §15 item 2 is **done** — `select_add_features.py` was run over all
+**2,973,489** nodes (coverage 0.19% → 100%), full detail in the companion
+`fullscale_feature_extraction_report.md`. In the course of that run, three defects were found that
+change how the results already in this document should be read, and one of them is serious:
+
+1. **The graph-feature branch was inert in every experiment recorded here.** `train1.py` read a
+   5,655-row feature CSV and falls back to `zero_features` for anything missing, so **99.81% of
+   accounts received an all-zero feature vector** — in Attempt 3's 20,000-example corpus, roughly
+   **36** examples had real features. Worse, because that CSV came from `select_add_features.py`'s
+   5:5 phisher/normal sample, *having* a non-zero vector was itself a **202×** signal for the positive
+   class (P(features|phishing)=35.5% vs P(features|benign)=0.18%). So the third modality was either
+   silent or emitting a sampling artifact. **Every F1 in §9/§11/§12/§17 was measured under that
+   condition** and should not be read as reflecting a working three-modality model.
+2. **`TOP10_FEATURE_NAMES` rests on a broken selection.** It came from |Spearman| computed on the OLD
+   ad-hoc split (38% of its "TRAIN" rows are val/overlap/pure_test under the current T_cutoff split),
+   at 16.0% positive against a real 0.0267% (~600× enrichment), on 0.23% of the train partition, and
+   against `phisher_accounts.txt` labels rather than ground truth.
+3. **Two disagreeing label sets exist.** `phisher_accounts.txt` (5,480 in graph) vs `labels.pkl`/`isp`
+   (1,165) overlap on only **963** addresses — 4,517 only-txt, 202 only-isp, so they disagree in both
+   directions rather than one being a superset. The `.txt` never reached the model (labels come from
+   `InputExample.label` via `isp`), so no number here is label-corrupted; but it did drive the feature
+   selection in (2). The `.txt` is now **retired**, replaced by `raw_data/MulDiGraph/
+   phisher_account_muldi.txt` (1,165 addresses exported from `isp`). Which set is correct for this
+   dataset remains an open provenance question.
+
+Acted on: `train1.py` and `eval_full_test.py` now consume **all 23 extracted features at full
+coverage** (the selection step is dropped rather than re-run, since a feature-only baseline confirms
+all-23 > old-top-10). Attempt 3's configuration was re-run unchanged except for the feature branch —
+new §18.
+
+**Revision note (feature-only baseline reframes the evaluation, same session):** a plain
+`HistGradientBoosting` on the 23 features alone — no BERT, no GCN, no fusion, **4 seconds** to fit —
+scores **F1(pos) 0.3479 on the full 811,704-account test partition**, against Attempt 3's **0.0549**
+(`full_scale_test_eval_report.md` §4). On the bounded 10,000-node test used throughout §11 the ranking
+reverses (baseline 0.4937 vs Attempt 3 0.6227). This is **not** a fair architecture comparison — the
+baseline trains on all 1,945,607 train accounts, Attempt 3 on 20,000, a 97× difference — but the
+reversal is itself the finding: **the bounded test composition (5.29% positive vs a real 0.065%)
+flatters the model**, so §11's numbers overstate real-distribution capability. Full detail in
+`fullscale_feature_extraction_report.md` §15.
+
 Scope executed: **Path B — restore & rebuild on the real MulDiGraph dataset.** The real
 `raw_data/MulDiGraph/MulDiGraph.pkl` (2,973,489 nodes / 13,551,303 edges / 1,165 phishing accounts,
 loaded directly, not from the broken Git-LFS stubs under `data/preprocessed/Multigraph/`) was used to
@@ -617,8 +685,19 @@ next step (§15).
    much more tractable — roughly **5 hours** at the measured eval-step rate — and are the more
    realistic next full-scale deliverable (score an already-trained-at-bounded-scale checkpoint against
    the entire real test set, rather than train from scratch at full scale).
-2. `select_add_features.py` needs to be re-run over the full 2,973,489-node graph so
-   `mg_refit_features.py`'s train-only scaler is fit on real coverage, not a 0.2% sample.
+2. ~~`select_add_features.py` needs to be re-run over the full 2,973,489-node graph so
+   `mg_refit_features.py`'s train-only scaler is fit on real coverage, not a 0.2% sample.~~
+   — **done** (follow-up session): all 2,973,489 nodes extracted, coverage 0.19% → **100%**, 22.13 h on
+   16 CPU workers via a `scipy.sparse` rewrite of the BFS/ball construction (the original networkx path
+   needs ~15 GB resident, which makes process parallelism impossible). Fidelity verified against the
+   unmodified original script — group 1+2 exact on all clean seeds, 7 of 8 centralities exact to
+   0.0e+00, `betweenness` matched only within the original's own un-seeded sampling spread. Scaler now
+   fit on the real 1,945,607 train rows; the 0.2% fit it replaces was inflating
+   `betweenness_centrality` by ~7× (train std 0.023175 vs the true 0.003276). This also surfaced the
+   inert-feature-branch defect described in the revision notes at the top of this document. Full
+   detail: `fullscale_feature_extraction_report.md`.
+   **Newly open in its place:** run `eval_full_test.py --feature_set all23` on the §18 checkpoint over
+   all 811,704 test accounts — §18's numbers are bounded-test only and therefore not decisive.
 3. `mg_build_examples.py --cap_train 0 --cap_overlap 0 --cap_val 0 --cap_test 0` for the real,
    non-subsampled corpus (1,945,607 / 216,178 / 201,931 / 609,773 accounts) — even after (1), expect
    multi-day wall clock on a single GPU at this scale.
@@ -708,3 +787,337 @@ note) and the literature-grounded novelty direction.
   optimizer-state-restore fallback now guards the reverse direction (an Adam-saved checkpoint's
   optimizer state failing to load into BertAdam)
 - `Dataset/mg_graph_weight_formula.py` — unchanged, reused as before
+
+## 17. Expanded-test label propagation + Attempt 3 retrain (follow-up session) — **new**
+
+Separate experiment, additive to everything above — does not modify or replace `mg_propagate_labels.py`,
+the existing `Dataset_MG` split/corpus, or the existing Attempt 3 checkpoint (`..._attempt3v2.pt`). Full
+narrative detail also in `dynamic_fusion_leakage_audit/expanded_test_propagation_report.md` (first,
+hub-guarded version of the idea, superseded by the simpler approach below at the user's request).
+
+### 17.1 Why
+
+The real test set has only 529 verified-phishing accounts out of 811,704 (§3: ≈1:1534) — very sparse
+for evaluation. This experiment grows the labeled-fraud pool available for both train and test via
+1-hop propagation from the same 1,165 verified seeds, **on request allowing propagated labels into
+val/test** (the opposite of §4's train-only, no-leakage design, which stays unchanged and is still
+what the main benchmark numbers in this report use).
+
+### 17.2 Method — `Dataset/mg_propagate_labels_expanded_test.py` (new script)
+
+Basic/no-guard version, per explicit follow-up instruction to simplify: for every 1,165 verified seed,
+every 1-hop **out**-neighbor (money flowing away from the seed) is labeled fraud too — no hub/exchange
+degree filter, no victim tracking, no soft-label weighting, no PASS/FAIL assertions. Result stored as
+`isp_expanded` (separate from `isp`, which is never modified), landing wherever the account's existing
+partition already placed it (train/val/overlap/pure_test).
+
+Full-graph run (2,973,489 nodes / 13,551,303 edges):
+
+| Partition | Accounts | Fraud before (`isp`) | Fraud after (`isp_expanded`) |
+|---|---:|---:|---:|
+| train | 1,945,607 | 519 | 3,541 |
+| val | 216,178 | 117 | 463 |
+| overlap | 201,931 | 217 | 2,587 |
+| pure_test | 609,773 | 312 | 1,581 |
+| **test (overlap+pure_test)** | **811,704** | **529** | **4,168** |
+| **Total** | **2,973,489** | **1,165** | **8,172** |
+
+1-hop propagation found 7,007 new accounts total (much larger than §4's 1,319 — no hub guard means a
+few high-degree seeds fan out to many accounts each). Output: `data/preprocessed/Dataset_MG/isp_expanded.pkl`.
+
+### 17.3 Attempt 3 retrain on the expanded labels — isolated folder
+
+Pipeline re-executed end-to-end, reusing every label-independent artifact as-is (T_cutoff split,
+`adj_train.npz`/`adj_inference.npz`, `features_output_top10_MG_fixed.csv` — none of these depend on
+which label file is used) and rebuilding only the corpus step against `isp_expanded`:
+
+1. `mg_build_examples.py` — given new `--split_dir`/`--out_dir`/`--labels_source` flags (added this
+   session, backward-compatible, default behavior unchanged) so it can build from
+   `Dataset_MG/isp_expanded.pkl` without touching the shared `Dataset_MG`/`multi_processed_data_MG`
+   folders. Same caps as the original Attempt 3 (`--cap_train 20000 --cap_overlap 5000 --cap_val 5000
+   --cap_test 5000`), output written to `Dynamic_Fusion/runs/expanded_test_attempt3/corpus/`.
+   Resulting corpus: 35,000 vocab, train phishing rate 17.71% (3,541/20,000 — all real
+   `isp_expanded`-positive train accounts kept, capped fill), valid phishing rate 9.26% (463/5,000),
+   test phishing rate 41.68% (4,168/10,000: pure_test 1,581/5,000 + overlap 2,587/5,000).
+2. `train1.py` — given new `--data_dir`/`--output_dir` flags (same session, backward-compatible) so
+   checkpoints land in `Dynamic_Fusion/runs/expanded_test_attempt3/checkpoints/` instead of the shared
+   `Dataset/tri_model/output/`. Launched with the exact Attempt 3 config (§11): `--lr 2e-5
+   --warmup_ratio 0.1 --max_epochs 15 --patience 5`, plus `--run_tag expanded_test_attempt3` so the
+   checkpoint filename (`ETH_GBert16_model_Dataset_MG_cle_sw0_vocab35000_expanded_test_attempt3.pt`)
+   cannot collide with the existing `..._attempt3v2.pt` even by accident. Run in a detached tmux
+   session (survives disconnects, matching this project's established convention for multi-hour runs).
+
+**Training result:** ran the full 15 epochs (0–14), never hit early-stopping's patience=5 (best epoch
+12, 2/5 epochs without improvement when the epoch budget ran out) — total wall clock **454.6 minutes
+(~7.58h)**, close to Attempt 3's original 398.9 minutes given the larger positive class made every
+epoch's `WeightedRandomSampler`-driven batches somewhat different in composition.
+
+| Epoch | Valid F1(pos) | Valid F1(weighted) | Outcome |
+|---:|---:|---:|---|
+| 0 | 0.6801 | 0.9254 | new best |
+| 1 | 0.7621 | 0.9487 | new best |
+| 2 | 0.7704 | 0.9510 | new best |
+| 3 | (0.7704) | — | no improvement, 1/5 |
+| 4 | 0.7926 | 0.9567 | new best |
+| 5 | (0.7926) | — | no improvement, 1/5 |
+| 6 | (0.7926) | — | no improvement, 2/5 |
+| 7 | 0.7986 | 0.9581 | new best |
+| 8 | (0.7986) | — | no improvement, 1/5 |
+| 9 | 0.8069 | 0.9603 | new best |
+| 10 | (0.8069) | — | no improvement, 1/5 |
+| 11 | (0.8069) | — | no improvement, 2/5 |
+| **12** | **0.8109** | **0.9620** | **new best (final)** |
+| 13 | 0.8098 | 0.9627 | no improvement, 1/5 |
+| 14 | 0.8074 | 0.9623 | no improvement, 2/5 (epoch budget exhausted) |
+
+Calibrated threshold (val only, argmax F1): **0.6976** (val F1(pos) at that point: 0.8168).
+
+**Step 6 — final test breakdown, best checkpoint (epoch 12) reloaded, calibrated threshold applied:**
+
+| Slice | n | pos | F1(pos) | F1(weighted) | AUPRC | G-Mean | Recall@100 | Recall@500 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| pure_test | 5,000 | 1,581 | **0.9038** | 0.9408 | 0.9474 | 0.9208 | 0.0607 | 0.3125 |
+| overlap | 5,000 | 2,587 | **0.8605** | 0.8526 | 0.8846 | 0.8515 | 0.0371 | 0.1774 |
+| overall | 10,000 | 4,168 | **0.8763** | 0.8971 | 0.9155 | 0.8937 | 0.0228 | 0.1173 |
+
+Step 8 runtime checks: all PASS (`train_examples` n=20,000, train-partition only; test has both
+classes, phishing_rate=0.4168; reporting used the label file loaded as this run's `labels` —
+i.e. `isp_expanded`, not the original strict `isp` — see §17.4 caveat).
+
+### 17.4 Why this is NOT an "improvement over Attempt 3" — read together with §11, not against it
+
+Test F1(pos) overall = **0.8763** vs. Attempt 3's **0.6227** looks like a large jump, but the two runs
+are scoring against **different test sets with different difficulty**:
+
+- Attempt 3 (§11): test positive rate ≈ 5.29% (529 real phishing / 10,000, real-distribution sample of
+  the strict ground-truth `isp`).
+- This run: test positive rate = 41.68% (4,168 / 10,000), because the un-guarded 1-hop propagation
+  added mostly-inferred "suspected fraud" labels directly into the test partitions.
+
+A test set that is ~40% positive is a categorically easier classification problem than one that is
+~5% positive — most of the F1(pos) gain here is attributable to that shift in class balance, not to
+the model learning anything new. Additionally, roughly (4,168-529)/4,168 ≈ 87% of this run's test
+positives are **propagated (inferred), not verified** — the model is being scored substantially against
+its own family of heuristic labels (1-hop out-neighbor of a seed), which inflates apparent performance
+further since propagated accounts are structurally closer to a seed than a random negative is.
+
+**Correct reading:** this result answers "can the model learn well when given a denser, propagation-
+expanded label set" (yes — F1(pos) 0.88, Recall 91%, Precision 91% on that expanded target), not
+"is the model better at detecting real phishing than Attempt 3 was." The original strict-`isp`
+benchmark numbers (§9, §11 Attempt 3: test F1(pos) 0.6227 on the real 529-positive test set) remain the
+valid comparison point for actual phishing-detection quality and are unaffected by this run — `isp`
+itself was never modified, only read from a differently-sourced `labels.pkl`-equivalent (`isp_expanded`)
+for this one isolated experiment.
+
+### 17.5 Isolation / no checkpoint overlap
+
+All new artifacts for this experiment live under `Dynamic_Fusion/runs/expanded_test_attempt3/`:
+
+- `corpus/` — this run's `data_Dataset_MG.*` + `gcn_adj_{train,eval}.npz` (35,000-vocab, built from
+  `isp_expanded`)
+- `checkpoints/` — `ETH_GBert16_model_Dataset_MG_cle_sw0_vocab35000_expanded_test_attempt3.pt` (+
+  `..._resume.pt`), distinct filename (via `--run_tag`) and distinct folder (via `--output_dir`) from
+  the existing `Dataset/tri_model/output/..._attempt3v2.pt`
+- `logs/build_examples.log`, `logs/train1_attempt3.log` — full console output
+
+Nothing under the shared `data/preprocessed/Dataset_MG/`, `data/preprocessed/multi_processed_data_MG/`,
+or `Dataset/tri_model/output/` was overwritten. `mg_build_examples.py` (`--split_dir`/`--out_dir`/
+`--labels_source`) and `train1.py` (`--data_dir`/`--output_dir`) gained new optional flags to make this
+possible; all default to the original shared paths when omitted, so every prior command in this report
+still reproduces unchanged.
+
+### 17.6 Full-scale evaluation (all 811,704 real test accounts) — **new**
+
+Same evaluation-only protocol as `full_scale_test_eval_report.md` (that report's §1(b)/§3 vocab-
+extension-as-prefix technique, reused as-is), applied to the §17.3 checkpoint instead of `attempt3v2`.
+`mg_build_full_test_eval.py` and `tri_model/eval_full_test.py` were extended with new, backward-
+compatible flags (`--old_corpus_dir`/`--out_dir`/`--labels_source`/`--reuse_docs_from` on the corpus
+builder; `--old_data_dir`/`--full_test_dir` on the evaluator) so an arbitrary checkpoint/vocab/label
+combination can be pointed at without touching `full_scale_test_eval_report.md`'s original run or
+files. Already-tokenized sentences for all 811,704 accounts were reused via `--reuse_docs_from`
+(text depends only on an account's transactions, never on vocab order or label source) — skips the
+expensive tokenization pass entirely, only the vocab prefix/adjacency slice was rebuilt.
+
+**Corpus**: extended vocab = this run's own 35,000-account training vocab (unchanged, exact prefix) +
+801,704 newly-appended real test accounts = **836,704** total, `gcn_adj_eval` nnz=2,145,493. Built with
+`--labels_source isp_expanded.pkl`, which also writes a parallel `test_y_strict` array (`labels.pkl`)
+so the identical set of predictions can be scored against **both** label sets in one evaluation pass —
+no second forward pass needed.
+
+**Checkpoint load verified** (same methodology as `full_scale_test_eval_report.md` §4): `missing=
+['embeddings.vocab_gcn.W0_vh']`, `unexpected=[]`, `W0_vh[:35000]` bit-identical to the checkpoint,
+epoch=12/`perform_metrics`=0.8109 loaded correctly.
+
+**Two independent threshold calibrations on the same validation set** (5,000 accounts, all in-vocab):
+
+| Calibrated against | Val positives | Threshold | Val F1(pos) at threshold |
+|---|---:|---:|---:|
+| this run's own labels (`isp_expanded`) | 463 | **0.6976** | 0.8168 |
+| strict ground-truth `isp` | 117 | **0.9020** | 0.3233 |
+
+The strict-`isp` calibration is markedly less confident (F1(pos)=0.32 vs 0.82) — expected, since this
+checkpoint was trained to recognize the denser, propagation-augmented positive class, not the sparser
+true-phishing signal specifically.
+
+**Runtime**: 214.5 minutes for the full test pass (811,704 accounts) + ~2 minutes for val calibration
+≈ **3.6h total**, matching `full_scale_test_eval_report.md`'s ~3.6h for the same account count (same
+per-step rate, ~126ms/step at the end vs. the ~110-140ms/step range reported there).
+
+**Results — scored against `isp_expanded` (this run's own training target, threshold 0.6976):**
+
+| Slice | n | pos | F1(pos) | F1(weighted) | AUPRC | G-Mean | Recall@100 | Recall@500 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| pure_test | 609,773 | 1,581 | 0.1608 | 0.9859 | 0.1816 | 0.9220 | 0.0032 | 0.0342 |
+| overlap | 201,931 | 2,587 | 0.1151 | 0.8941 | 0.1067 | 0.8516 | 0.0012 | 0.0738 |
+| **overall** | **811,704** | **4,168** | **0.1290** | 0.9643 | 0.1386 | 0.9066 | 0.0005 | 0.0228 |
+
+**Same predictions, re-scored against strict ground-truth `isp` (threshold 0.9020) — directly
+comparable to `full_scale_test_eval_report.md` §4's tri_model numbers:**
+
+| Slice | n | pos | F1(pos) | F1(weighted) | AUPRC | G-Mean | Recall@100 | Recall@500 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| pure_test | 609,773 | 312 | 0.0632 | 0.9954 | 0.0377 | 0.7287 | 0.0000 | 0.0481 |
+| overlap | 201,931 | 217 | 0.0261 | 0.9722 | 0.0597 | 0.7850 | 0.0000 | 0.4009 |
+| **overall** | **811,704** | **529** | **0.0383** | 0.9898 | 0.0408 | 0.7558 | 0.0000 | 0.0605 |
+
+Step 8 checks: **PASS** — `n`/`pos` exact for both label sets (811,704/811,704; 4,168/4,168 for
+`isp_expanded`, 529/529 for strict `isp`).
+
+**Direct comparison — this checkpoint vs. the original Attempt 3 checkpoint (`attempt3v2`), same full
+811,704-account test set, both scored against strict ground-truth `isp`:**
+
+| Metric (overall, strict isp) | attempt3v2 (`full_scale_test_eval_report.md` §4) | expanded_test_attempt3 (§17.6) |
+|---|---:|---:|
+| F1(pos) | 0.0549 | **0.0383** |
+| F1(weighted) | 0.9921 | 0.9898 |
+| AUPRC | 0.1241 | **0.0408** |
+| G-Mean | 0.7960 | 0.7558 |
+| Recall@500 | 0.2590 | **0.0605** |
+
+**Reading this: the expanded-label checkpoint is not better at real phishing detection at full scale —
+it is worse, on every metric, than the original strict-`isp`-trained checkpoint**, most sharply on
+AUPRC (0.041 vs 0.124, a 3× drop) and Recall@500 (0.061 vs 0.259, a 4.3× drop). This is consistent
+with — and sharpens — §17.4's caveat: project-wide, 7,007 of the 8,172 total labeled-fraud accounts
+(≈86%) are propagated/inferred "suspected fraud" (1-hop out-neighbors of a seed, no hub guard), not
+verified phishing — and this checkpoint's 20,000-account train partition mirrors that skew (3,541
+train positives vs. only 519 real ground-truth phishing accounts in `train`, §3). The model learned to recognize
+*that* broader, noisier pattern well (§17.3: F1(pos)=0.88 against its own `isp_expanded` target at
+bounded scale), but that pattern is evidently a worse proxy for actual phishing accounts than training
+on the smaller, clean, strictly-verified seed set was — full-scale evaluation against real ground
+truth is what exposes this; the bounded-scale numbers (§17.3-17.4, scored against the same expanded
+labels used for training) could not have shown it, since they were never checked against strict `isp`
+at all before this section.
+
+**What this does and doesn't establish:** it is one data point, from one propagation configuration
+(no hub guard, no soft-label down-weighting, `--propagation-weight` not applicable since this script
+doesn't have that mechanism — see §17.2) and one training run. It does not by itself prove that *no*
+label-propagation-based augmentation can help real phishing detection — `mg_propagate_labels.py`'s
+original, hub-guarded, soft-weighted, train-only design (§4) is a materially different, more
+conservative mechanism that has not been evaluated at full scale in this document. What it does
+establish is that this specific expanded-test approach, evaluated properly at full scale against
+strict ground truth, underperforms the existing best full-scale checkpoint — the bounded-scale
+"0.88 F1(pos)" number from §17.3 was measuring fit to an inferred label, not phishing-detection
+quality, exactly as flagged in §17.4 before this run existed to confirm it.
+
+**Files**: `runs/expanded_test_attempt3/full_test_corpus/` (corpus), `runs/expanded_test_attempt3/logs/
+{build_full_test,eval_full_test}.log` (full console output), wandb run
+[`yz0kayvm`](https://wandb.ai/hngocvo207-national-economic-university/fraud_detection/runs/yz0kayvm).
+
+## 18. Full feature coverage + all 23 features — Attempt 3 re-run (follow-up session) — **new**
+
+Companion document: `fullscale_feature_extraction_report.md`.
+
+### 18.1 What changed and why
+
+The graph-feature branch had never actually functioned (see the revision notes at the top of this
+document): `train1.py` read a 5,655-row feature CSV against a 2,973,489-account graph, so
+`zero_features` fired for **99.81%** of accounts, and because that CSV came from a 5:5 phisher/normal
+sample, merely having a non-zero vector was a **202×** signal for the positive class. Two changes
+were applied together:
+
+| file | change |
+|---|---|
+| `tri_model/train1.py` | `GRAPH_FEATURE_NAMES` = all 23 extracted features; reads `features_output_all23_MG_fullscale.csv` (full 2,973,489-account coverage, `StandardScaler` fit on the `train` partition only) |
+| `tri_model/eval_full_test.py` | new `--feature_set {all23,legacy10}`, default `all23` |
+
+The univariate top-10 selection was **dropped rather than re-run**. Its basis is broken three ways
+(old split / 600× enrichment / wrong label set), a re-run would rest on 519 train positives, and
+23 features against 1.9M training rows is not a dimensionality problem. A feature-only baseline
+confirms the choice empirically: on the full test partition, all-23 beats the old top-10 for both
+model families (HistGBM F1(pos) 0.3479 vs 0.3168; LogReg 0.0657 vs 0.0514).
+
+`legacy10` is retained deliberately: a checkpoint bakes the `FeatureProjector`'s input dimension, so
+every pre-existing checkpoint — including the one behind `full_scale_test_eval_report.md` — can only
+be re-scored under the configuration it was trained with. Scoring an old checkpoint as `all23` fails
+on a shape mismatch rather than silently producing wrong numbers.
+
+A performance defect had to be fixed first: the feature lookup built **one torch tensor per account**
+via `df.iterrows()` — free at 5,655 rows, but >7 GB RSS and unfinished after 5 minutes at full
+coverage. Replaced in both files by a single `[N, 23]` tensor plus a `str→row` index: **21 s and
+2.86 GB** for a complete smoke run. Left unfixed it would have recurred on every full-scale
+811,704-example evaluation.
+
+### 18.2 Result — same corpus, same config, only the feature branch changed
+
+BertAdam, `--lr 2e-5 --warmup_ratio 0.1 --max_epochs 15 --patience 5`, weighted sampler, neutral focal
+alpha, F1(pos) selection; same 20,000/5,000×3 corpus, same `gcn_vocab_size=35,000`. Checkpoint
+`..._vocab35000_all23_fullcov.pt`. Wall clock **240.2 min (~4.0 h)** vs Attempt 3's 6.65 h; early
+stopping at epoch 7, **best epoch 2** (Attempt 3: epoch 7).
+
+| epoch | Attempt 3 valid F1(pos) | all-23 valid F1(pos) |
+|---:|---:|---:|
+| 0 | 0.1863 | **0.4849** |
+| 1 | 0.2022 | **0.5812** |
+| 2 | 0.4764 | **0.6732** ← best |
+| 3 | 0.5090 | 0.5324 |
+| 4 | 0.5939 | 0.4912 |
+| 5 | 0.6464 | 0.5808 |
+| 6 | (0.6464) | 0.5767 |
+| 7 | **0.6667** ← best | 0.5385 → early stop |
+
+Calibrated threshold (val only, argmax F1): **0.8562** (val F1(pos) 0.7984).
+
+| Slice | n | pos | F1(pos) | F1(weighted) | AUPRC | G-Mean | Recall@100 | Recall@500 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| pure_test | 5,000 | 312 | **0.7582** | 0.9718 | 0.7818 | 0.8122 | 0.2821 | 0.8526 |
+| overlap | 5,000 | 217 | **0.5987** | 0.9640 | 0.4652 | 0.7886 | 0.2903 | 0.7788 |
+| overall | 10,000 | 529 | **0.6852** | 0.9675 | 0.5822 | 0.8019 | 0.1304 | 0.6711 |
+
+| | Attempt 3 (§11) | all-23 full coverage | Δ |
+|---|---:|---:|---:|
+| overall F1(pos) | 0.6227 | **0.6852** | **+0.0625** |
+| pure_test F1(pos) | 0.7406 | **0.7582** | +0.0176 |
+| overlap F1(pos) | 0.5107 | **0.5987** | **+0.0880** |
+| overall AUPRC | 0.6904 | 0.5822 | **−0.1082** |
+
+### 18.3 Reading this result — not a clean win
+
+F1(pos) improves on every slice, and the largest gain is on `overlap` (+0.088) — the slice §11 and §9
+both identified as this model's persistent weakness. That is what one would predict if the feature
+branch went from inert to informative.
+
+But **AUPRC moved the other way** (0.6904 → 0.5822). AUPRC is threshold-free; F1(pos) depends on a
+threshold calibrated on 117 validation positives. The two metrics disagreeing means the new model
+**ranks slightly worse overall but sits better at the chosen operating point**. With 529 test
+positives a 0.06 F1 difference is also within the range a different random seed could produce. The
+honest summary is *no worse, probably better at the operating point, ranking quality unresolved* — not
+a clean improvement.
+
+Two further caveats:
+
+1. **Best epoch fell from 7 to 2**, after which validation F1(pos) degrades monotonically. With real
+   features present the model peaks much sooner and then overfits — plausible, but it also means only
+   three epochs of signal informed the selection.
+2. **This is the bounded 10,000-node test at 5.29% positive**, the composition the feature-only
+   baseline showed to be flattering (HistGBM 0.4937 here vs 0.3479 on the real distribution; Attempt 3
+   0.6227 here vs 0.0549 there). **No conclusion about real-world capability follows from §18.2.**
+
+The decisive measurement is the full-scale evaluation of this checkpoint —
+`eval_full_test.py --ckpt ..._all23_fullcov.pt --feature_set all23` over all 811,704 test accounts,
+against Attempt 3's 0.0549 and the feature-only baseline's 0.3479. **Not yet run**; tracked as the new
+§15 item 2.
+
+**Files**: `Dataset/tri_model/output/ETH_GBert16_model_Dataset_MG_cle_sw0_vocab35000_all23_fullcov.pt`,
+`Dataset/logs/retrain_all23_fullcov.log`, `Dataset/fullscale_features/` (extraction + baseline code),
+`raw_data/MulDiGraph/features_output_all23_MG_fullscale.csv`,
+`raw_data/MulDiGraph/phisher_account_muldi.txt`.

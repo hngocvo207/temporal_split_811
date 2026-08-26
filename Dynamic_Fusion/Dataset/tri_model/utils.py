@@ -272,3 +272,56 @@ class CorpusDataset(Dataset):
             batch_graph_features,    # ← Đảm bảo trả về đủ 7 phần tử
             batch_sample_weights,    # ← per-example loss weight (soft propagated labels)
         )
+
+
+"""
+Step 6 report helpers -- factored out of train1.py so eval_full_test.py (and
+any other eval-only script) can reuse the exact same pure_test/overlap/overall
+breakdown logic instead of duplicating it.
+"""
+
+from sklearn.metrics import f1_score, average_precision_score
+
+
+def g_mean(y_true, y_pred):
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    tn = int(((y_pred == 0) & (y_true == 0)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) else 0.0
+    return (sensitivity * specificity) ** 0.5
+
+
+def recall_at_k(y_true, pos_probs, k):
+    if len(y_true) == 0:
+        return float("nan")
+    k = min(k, len(y_true))
+    order = np.argsort(-pos_probs)[:k]
+    n_pos_total = int(y_true.sum())
+    if n_pos_total == 0:
+        return float("nan")
+    return float(y_true[order].sum()) / n_pos_total
+
+
+def report_slice(name, mask, test_y_true, test_y_pred, test_pos_probs):
+    yt = test_y_true[mask]
+    yp = test_y_pred[mask]
+    pp = test_pos_probs[mask]
+    if len(yt) == 0 or yt.sum() == 0:
+        print(f"  [{name}] n={len(yt)} -- skipped (no positive examples in this slice at this sample size)")
+        return None
+    f1_pos = f1_score(yt, yp, pos_label=1, zero_division=0)
+    f1_weighted = f1_score(yt, yp, average="weighted", zero_division=0)
+    auprc = average_precision_score(yt, pp)
+    gm = g_mean(yt, yp)
+    r_at = {k: recall_at_k(yt, pp, k) for k in (100, 500)}
+    print(
+        f"  [{name}] n={len(yt)} pos={int(yt.sum())}  F1(pos)={f1_pos:.4f}  F1(weighted)={f1_weighted:.4f}  "
+        f"AUPRC={auprc:.4f}  G-Mean={gm:.4f}  "
+        f"Recall@100={r_at[100]:.4f}  Recall@500={r_at[500]:.4f}"
+    )
+    return {
+        "n": len(yt), "pos": int(yt.sum()), "f1_pos": f1_pos, "f1_weighted": f1_weighted,
+        "auprc": auprc, "g_mean": gm, "recall_at": r_at,
+    }

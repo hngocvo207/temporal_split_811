@@ -193,33 +193,72 @@ def main():
         help="50/50-ish pos/neg subsample per partition (smoke-test mode). "
              "Default off: keep ALL real phishing + fill cap with real negatives.",
     )
+    ap.add_argument(
+        "--split_dir", type=str, default=str(SPLIT_DIR),
+        help="Directory holding labels.pkl/partition.pkl/adjacency (default: the shared "
+             "data/preprocessed/Dataset_MG produced by mg_temporal_pipeline.py). Read-only "
+             "input for this script -- override to point at a different labels source "
+             "without touching the shared split.",
+    )
+    ap.add_argument(
+        "--out_dir", type=str, default=str(OUT_DIR),
+        help="Directory to write this run's corpus into (default: the shared "
+             "data/preprocessed/multi_processed_data_MG). Override to keep a run's outputs "
+             "isolated in their own folder instead of overwriting the shared corpus.",
+    )
+    ap.add_argument(
+        "--labels_source", type=str, default="labels.pkl",
+        help="Which pkl file under --split_dir to treat as ground truth for this corpus "
+             "(e.g. 'isp_expanded.pkl' to build from mg_propagate_labels_expanded_test.py's "
+             "expanded fraud labels instead of the strict ground-truth isp). When this is not "
+             "'labels.pkl', isp_augmented/propagation_weight/label_source default to trivial "
+             "ground_truth/benign/uniform-weight-1.0 (no separate soft-label augmentation on "
+             "top of an already-expanded label set) unless matching files exist alongside it.",
+    )
     args = ap.parse_args()
+
+    split_dir = Path(args.split_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 78)
     print("  mg_build_examples.py — leakage-free TSV/example corpus (Step 4)")
     print("=" * 78)
+    print(f"  split_dir = {split_dir}")
+    print(f"  out_dir   = {out_dir}")
+    print(f"  labels_source = {args.labels_source}")
 
     sep("Load split + propagated labels + graph")
-    with open(SPLIT_DIR / "labels.pkl", "rb") as f:
+    with open(split_dir / args.labels_source, "rb") as f:
         labels = pickle.load(f)
-    with open(SPLIT_DIR / "partition.pkl", "rb") as f:
+    with open(split_dir / "partition.pkl", "rb") as f:
         partition = pickle.load(f)
-    with open(SPLIT_DIR / "split_config.json") as f:
+    with open(split_dir / "split_config.json") as f:
         import json
 
         config = json.load(f)
     T_cutoff = config["T_cutoff"]
 
-    # mg_propagate_labels.py outputs — required (pipeline order fixed by
-    # new_split.md §5: temporal_pipeline -> propagate_labels -> ...).
-    # isp_augmented == labels when propagation was generated with
-    # --enable-label-propagation off, so this is safe either way.
-    with open(SPLIT_DIR / "isp_augmented.pkl", "rb") as f:
-        isp_augmented = pickle.load(f)
-    with open(SPLIT_DIR / "propagation_weight.pkl", "rb") as f:
-        propagation_weight = pickle.load(f)
-    with open(SPLIT_DIR / "label_source.pkl", "rb") as f:
-        label_source = pickle.load(f)
+    # mg_propagate_labels.py outputs (train-only soft-label augmentation) --
+    # optional now: only meaningful when labels_source is the strict ground
+    # truth (labels.pkl). When building from an already-expanded label set
+    # (e.g. isp_expanded.pkl), there is no further augmentation to layer on
+    # top, so fall back to trivial ground_truth/benign/weight=1.0 derived
+    # straight from `labels`.
+    if args.labels_source == "labels.pkl" and (split_dir / "isp_augmented.pkl").exists():
+        with open(split_dir / "isp_augmented.pkl", "rb") as f:
+            isp_augmented = pickle.load(f)
+        with open(split_dir / "propagation_weight.pkl", "rb") as f:
+            propagation_weight = pickle.load(f)
+        with open(split_dir / "label_source.pkl", "rb") as f:
+            label_source = pickle.load(f)
+    else:
+        print(f"  [!] --labels_source={args.labels_source} -- no separate isp_augmented/"
+              f"propagation_weight/label_source found or applicable; using labels as-is "
+              f"(isp_augmented==labels, propagation_weight=1.0, label_source=ground_truth/benign)")
+        isp_augmented = dict(labels)
+        propagation_weight = {a: 1.0 for a in labels}
+        label_source = {a: ("ground_truth" if v == 1 else "benign") for a, v in labels.items()}
 
     with open(MG_PATH, "rb") as f:
         G = pickle.load(f)
@@ -300,11 +339,11 @@ def main():
     idx2label = {0: "0", 1: "1"}
 
     sep("Slice train-cutoff / inference adjacency to this vocab's order (Step 3)")
-    with open(SPLIT_DIR / "address_to_index.pkl", "rb") as f:
+    with open(split_dir / "address_to_index.pkl", "rb") as f:
         full_addr2idx = pickle.load(f)
     full_idx = [full_addr2idx[a] for a in account_list]
-    adj_train_full = load_npz(SPLIT_DIR / "adj_train.npz")
-    adj_inference_full = load_npz(SPLIT_DIR / "adj_inference.npz")
+    adj_train_full = load_npz(split_dir / "adj_train.npz")
+    adj_inference_full = load_npz(split_dir / "adj_inference.npz")
     gcn_adj_train = adj_train_full[full_idx, :][:, full_idx]
     gcn_adj_eval = adj_inference_full[full_idx, :][:, full_idx]
     print(f"  gcn_adj_train: shape={gcn_adj_train.shape} nnz={gcn_adj_train.nnz:,}")
@@ -313,7 +352,7 @@ def main():
     sep("Save")
 
     def save(obj, name):
-        p = OUT_DIR / name
+        p = out_dir / name
         with open(p, "wb") as f:
             pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
         print(f"  Saved: {p}")
@@ -332,10 +371,10 @@ def main():
     save(address_to_index, "data_Dataset_MG.address_to_index")
     save(test_partition, "data_Dataset_MG.test_partition")
     save(doc_accounts, "data_Dataset_MG.doc_accounts")
-    save_npz(OUT_DIR / "gcn_adj_train.npz", gcn_adj_train.tocsr())
-    save_npz(OUT_DIR / "gcn_adj_eval.npz", gcn_adj_eval.tocsr())
-    print(f"  Saved: {OUT_DIR / 'gcn_adj_train.npz'}")
-    print(f"  Saved: {OUT_DIR / 'gcn_adj_eval.npz'}")
+    save_npz(out_dir / "gcn_adj_train.npz", gcn_adj_train.tocsr())
+    save_npz(out_dir / "gcn_adj_eval.npz", gcn_adj_eval.tocsr())
+    print(f"  Saved: {out_dir / 'gcn_adj_train.npz'}")
+    print(f"  Saved: {out_dir / 'gcn_adj_eval.npz'}")
 
     sep("Step 8 spot-checks for this corpus")
     assert len(train_y) == len(pt_train)

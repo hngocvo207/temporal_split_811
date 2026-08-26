@@ -80,6 +80,18 @@ parser.add_argument(
          "item 6: three silent filename collisions this project has already hit that vocab "
          "size alone would not have caught).",
 )
+parser.add_argument(
+    "--data_dir", type=str, default="",
+    help="Override the corpus directory (default: data/preprocessed/multi_processed_data_MG "
+         "under the repo root). Use to read a corpus built by mg_build_examples.py's own "
+         "--out_dir into an isolated folder instead of the shared one.",
+)
+parser.add_argument(
+    "--output_dir", type=str, default="",
+    help="Override the checkpoint output directory (default: tri_model/output). Use to keep "
+         "a run's checkpoints in their own folder, avoiding any filename collision with other "
+         "runs sharing the default output dir.",
+)
 args = parser.parse_args()
 
 # Initialize WandB (credentials come from `wandb login`, stored in ~/.netrc — never hardcode the key here)
@@ -116,10 +128,17 @@ if env_config.TRANSFORMERS_OFFLINE == 1:
     )
 do_lower_case = True
 BASE_DIR = os.path.dirname(_DATASET_DIR)
-data_dir = os.path.join(BASE_DIR, "data/preprocessed/multi_processed_data_MG")
-output_dir = "./output/"
-if not os.path.exists(output_dir):
-    os.mkdir(output_dir)
+data_dir = args.data_dir if args.data_dir else os.path.join(BASE_DIR, "data/preprocessed/multi_processed_data_MG")
+# Anchored to this script's own directory, NOT the launch cwd -- "./output/"
+# previously resolved wherever the process happened to be started from, which
+# let bi_model/train_origin.py's identically-named-formula checkpoints land in
+# and silently overwrite this script's own checkpoints (see
+# preprocessing_and_eval_report.md / full_scale_test_eval_report.md: tri-modal's
+# Attempt-3 checkpoint was lost this way). --output_dir opts into a different
+# folder entirely (e.g. an isolated run directory) -- same collision-avoidance
+# goal, explicit opt-in instead of relying on script-relative default alone.
+output_dir = args.output_dir if args.output_dir else os.path.join(_THIS_DIR, "output")
+os.makedirs(output_dir, exist_ok=True)
 perform_metrics_str = "F1(pos)"  # model-selection / early-stopping criterion (validation set)
 classifier_act_func = nn.ReLU()
 resample_train_set = False
@@ -309,47 +328,104 @@ gcn_adj_list = gcn_adj_list_train  # kept for anything below still referencing g
 
 gc.collect()
 
-# ── Load top-10 Spearman graph features ──────────────────────────────────────
-# CẬP NHẬT ĐÚNG CÁC TÊN ĐẶC TRƯNG MỚI NHẤT
-TOP10_FEATURE_NAMES = [
-    "betweenness_centrality",
-    "clustering_coefficient",
-    "in_degree",
-    "freq_in_long",
-    "out_degree",
-    "freq_out_long",
-    "freq_out_short",
-    "max_out_amount",
-    "in_degree_centrality",
-    "active_days",
-    # "degree_centrality",
-    # "avg_out_amount",
-    # "freq_in_short",
-    # "out_degree_centrality",
-    # "max_in_amount",
-    # "lifetime_days",
-    # "closeness_centrality",
-    # "avg_in_amount",
-    # "short_long_in_ratio",
-    # "account_balance"
+# ── Graph features: ALL 23, full coverage ────────────────────────────────────
+# Replaces the previous top-10 Spearman selection + 5,655-row feature file.
+# Two independent reasons, both measured (fullscale_feature_extraction_report.md):
+#
+#  1. COVERAGE. The old file (features_output_top10_MG_fixed.csv) held 5,655 of
+#     2,973,489 accounts, so `zero_features` below fired for 99.81% of nodes --
+#     in a 20,000-example corpus roughly 36 examples had real features. Worse,
+#     because that file came from a 5:5 phisher/normal sample, merely HAVING a
+#     non-zero feature vector was a 202x signal for the positive class
+#     (P(features|phishing)=35.5% vs P(features|benign)=0.18%). The feature branch
+#     was therefore either silent or leaking. The new file covers all 2,973,489.
+#
+#  2. SELECTION. The top-10 came from |Spearman| computed on the OLD ad-hoc split
+#     (38% of its "TRAIN" rows are val/test under the current T_cutoff split), at
+#     16% positive vs a real 0.0267%, against phisher_accounts.txt labels which
+#     agree with ground-truth `isp` on only 963 of 1,165 addresses. Rather than
+#     re-run a selection resting on 519 positives, the selection step is dropped:
+#     23 features against 1.9M training rows is not a dimensionality problem.
+#     A feature-only baseline confirms all-23 > old-top-10 on the full test set
+#     (HistGBM F1(pos) 0.3479 vs 0.3168).
+GRAPH_FEATURE_NAMES = [
+    # Nhóm 1 — basic statistical (12)
+    "out_degree", "in_degree", "direction_ratio",
+    "max_out_amount", "min_out_amount", "avg_out_amount",
+    "max_in_amount", "min_in_amount", "avg_in_amount",
+    "account_balance", "lifetime_days", "active_days",
+    # Nhóm 2 — temporal frequency (6)
+    "freq_out_short", "freq_in_short", "freq_out_long", "freq_in_long",
+    "short_long_out_ratio", "short_long_in_ratio",
+    # Nhóm 3 — graph centrality (5; katz/closeness/eigenvector not extracted)
+    "betweenness_centrality", "degree_centrality", "clustering_coefficient",
+    "in_degree_centrality", "out_degree_centrality",
 ]
-NUM_GRAPH_FEATURES = len(TOP10_FEATURE_NAMES)
+TOP10_FEATURE_NAMES = GRAPH_FEATURE_NAMES        # back-compat alias
+NUM_GRAPH_FEATURES = len(GRAPH_FEATURE_NAMES)
 
 features_csv_path = os.path.join(
-    BASE_DIR, "raw_data/MulDiGraph/features_output_top10_MG_fixed.csv"
-)  # train-only-fit normalization (Step 3c) -- see mg_refit_features.py
+    BASE_DIR, "raw_data/MulDiGraph/features_output_all23_MG_fullscale.csv"
+)  # train-only-fit normalization over all 2,973,489 accounts
+#
+# NOTE (symmetric to mg_build_adjacency.py's adj_inference note): only the
+# NORMALIZATION (mean/std) is train-only-fit here (mg_refit_features.py /
+# fullscale_features/08_assemble_csv.py). The underlying RAW feature values
+# themselves (degree, centrality, active_days, ...) are computed once over
+# the FULL graph timeline (fullscale_features/02_groups12_exact.py's
+# --pre-cutoff flag defaults to None and was NOT used for this file -- see
+# fullscale_features/groups12_full.npz, no "precut" variant exists) and are
+# reused as-is for EVERY partition, including 'train'. So a train account's
+# feature vector (e.g. betweenness_centrality, degree_centrality) can be
+# influenced by graph structure that only exists because of edges added
+# AFTER T_cutoff elsewhere in the network -- unlike gcn_adj_train.npz, which
+# is strictly bounded to timestamp <= T_cutoff. This is the same kind of
+# transductive tradeoff already accepted for adj_inference (Step 3b), just
+# not yet applied/labeled symmetrically for node features. No --pre-cutoff
+# re-extraction has been run to produce a train-only-timeline alternative;
+# see dynamic_fusion_leakage_audit/pipeline_review_vs_code_check.md §D/§H.
 features_df = pd.read_csv(features_csv_path)
-
-# Tạo lookup dict: node_address (lowercase) → tensor [NUM_GRAPH_FEATURES]
-graph_features_lookup = {
-    str(row["node"]).lower(): torch.tensor(
-        row[TOP10_FEATURE_NAMES].values.astype(np.float32), dtype=torch.float
-    )
-    for _, row in features_df.iterrows()
-}
+missing = [c for c in GRAPH_FEATURE_NAMES if c not in features_df.columns]
+assert not missing, f"feature file is missing columns: {missing}"
 
 # Fallback tensor zeros nếu node không có trong CSV
 zero_features = torch.zeros(NUM_GRAPH_FEATURES, dtype=torch.float)
+
+
+class GraphFeatureLookup:
+    """
+    Drop-in for the dict this used to be (`.get(addr, default)` + truthiness).
+
+    The dict comprehension it replaces built one torch tensor PER ACCOUNT via
+    df.iterrows(). At the old 5,655-row coverage that was free; at full coverage
+    it is 2,973,489 tensors, which measured >7 GB RSS and had still not finished
+    after 5 minutes. Backing the whole thing with ONE [N, F] tensor plus a
+    str->row index costs ~273 MB for the matrix and loads in seconds; rows are
+    sliced on demand.
+    """
+
+    __slots__ = ("_m", "_i", "_default")
+
+    def __init__(self, df, cols, default):
+        self._m = torch.from_numpy(np.ascontiguousarray(
+            df[cols].to_numpy(dtype=np.float32)))
+        self._i = {a: k for k, a in enumerate(df["node"].astype(str).str.lower())}
+        self._default = default
+
+    def get(self, key, default=None):
+        k = self._i.get(key)
+        return self._default if k is None else self._m[k]
+
+    def __contains__(self, key):
+        return key in self._i
+
+    def __len__(self):
+        return len(self._i)
+
+
+graph_features_lookup = GraphFeatureLookup(
+    features_df, GRAPH_FEATURE_NAMES, zero_features)
+del features_df
 
 print(f"  Loaded graph features: {len(graph_features_lookup)} nodes, {NUM_GRAPH_FEATURES} features each")
 print(f"  Feature names: {TOP10_FEATURE_NAMES}")
@@ -530,6 +606,11 @@ def evaluate(
     correct = 0
     start = time.time()
     with torch.no_grad():
+        # Adjacency + GCN weights are frozen for this whole call (eval mode,
+        # no_grad, same gcn_adj_list on every batch below) -- compute the
+        # batch-invariant sparse_mm(adj, W) ONCE here instead of once per
+        # batch inside model.forward() (see VocabGraphConvolution.compute_H_vh).
+        precomputed_H_vh = model.compute_gcn_H_vh(gcn_adj_list)
         for batch in predict_dataloader:
             batch = tuple(t.to(device) for t in batch)
             (
@@ -546,7 +627,8 @@ def evaluate(
             logits = model(
                 gcn_adj_list, gcn_vocab_ids, input_ids,
                 graph_features,              # ← truyền vào model
-                segment_ids, input_mask
+                segment_ids, input_mask,
+                precomputed_H_vh=precomputed_H_vh,
             )
 
             loss = compute_loss(logits, label_ids, y_prob, is_training=False)
@@ -975,63 +1057,15 @@ _, _, _, _, _, _, test_y_true, test_y_pred, test_pos_probs = evaluate(
 )
 
 
-def g_mean(y_true, y_pred):
-    tp = int(((y_pred == 1) & (y_true == 1)).sum())
-    tn = int(((y_pred == 0) & (y_true == 0)).sum())
-    fp = int(((y_pred == 1) & (y_true == 0)).sum())
-    fn = int(((y_pred == 0) & (y_true == 1)).sum())
-    sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
-    specificity = tn / (tn + fp) if (tn + fp) else 0.0
-    return (sensitivity * specificity) ** 0.5
-
-
-def recall_at_k(y_true, pos_probs, k):
-    if len(y_true) == 0:
-        return float("nan")
-    k = min(k, len(y_true))
-    order = np.argsort(-pos_probs)[:k]
-    n_pos_total = int(y_true.sum())
-    if n_pos_total == 0:
-        return float("nan")
-    return float(y_true[order].sum()) / n_pos_total
-
-
-def report_slice(name, mask):
-    yt = test_y_true[mask]
-    yp = test_y_pred[mask]
-    pp = test_pos_probs[mask]
-    if len(yt) == 0 or yt.sum() == 0:
-        print(f"  [{name}] n={len(yt)} -- skipped (no positive examples in this slice at this sample size)")
-        return None
-    f1_pos = f1_score(yt, yp, pos_label=1, zero_division=0)
-    # Weighted F1 (support-weighted average over BOTH classes, sklearn
-    # average="weighted") -- reported alongside F1(pos) because the two can
-    # diverge sharply under heavy class imbalance: weighted F1 is pulled
-    # toward the majority (benign) class's near-perfect F1, while F1(pos) is
-    # the metric that actually reflects phishing-detection quality. Computed
-    # per-slice here (pure_test / overlap / overall) so all three are
-    # comparable in one table instead of only the combined Test_set number
-    # printed separately by evaluate().
-    f1_weighted = f1_score(yt, yp, average="weighted", zero_division=0)
-    auprc = average_precision_score(yt, pp)
-    gm = g_mean(yt, yp)
-    r_at = {k: recall_at_k(yt, pp, k) for k in (100, 500)}
-    print(
-        f"  [{name}] n={len(yt)} pos={int(yt.sum())}  F1(pos)={f1_pos:.4f}  F1(weighted)={f1_weighted:.4f}  "
-        f"AUPRC={auprc:.4f}  G-Mean={gm:.4f}  "
-        f"Recall@100={r_at[100]:.4f}  Recall@500={r_at[500]:.4f}"
-    )
-    return {
-        "n": len(yt), "pos": int(yt.sum()), "f1_pos": f1_pos, "f1_weighted": f1_weighted,
-        "auprc": auprc, "g_mean": gm, "recall_at": r_at,
-    }
-
+# g_mean / recall_at_k / report_slice now live in utils.py (imported via
+# `from utils import *` above) so eval_full_test.py can reuse the exact same
+# pure_test/overlap/overall breakdown logic instead of duplicating it.
 
 print(f"\n  Calibrated threshold used: {calibrated_threshold:.4f}")
 test_partition_arr = np.array(test_partition)
-metrics_pure_test = report_slice("pure_test", test_partition_arr == "pure_test")
-metrics_overlap = report_slice("overlap", test_partition_arr == "overlap")
-metrics_overall = report_slice("overall (pure_test+overlap)", np.ones(len(test_y_true), dtype=bool))
+metrics_pure_test = report_slice("pure_test", test_partition_arr == "pure_test", test_y_true, test_y_pred, test_pos_probs)
+metrics_overlap = report_slice("overlap", test_partition_arr == "overlap", test_y_true, test_y_pred, test_pos_probs)
+metrics_overall = report_slice("overall (pure_test+overlap)", np.ones(len(test_y_true), dtype=bool), test_y_true, test_y_pred, test_pos_probs)
 
 # Step 8 — runtime validation checks (PASS/FAIL)
 print("\n----- Step 8: runtime validation checks -----")

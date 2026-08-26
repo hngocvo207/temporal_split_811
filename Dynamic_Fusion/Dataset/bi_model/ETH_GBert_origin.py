@@ -41,21 +41,39 @@ class VocabGraphConvolution(nn.Module):
             ):
                 init.kaiming_uniform_(p, a=math.sqrt(5))
 
-    def forward(self, vocab_adj_list, X_dv, add_linear_mapping_term=False):
+    def forward(self, vocab_adj_list, words_embeddings, gcn_vocab_ids, add_linear_mapping_term=False):
+        """Sparse gather/embedding-lookup form (replaces the dense one-hot
+        "gcn_swop_eye" scatter-matmul: X_dv.matmul(H_vh) where X_dv was a
+        [B, H_bert, vocab_size] tensor built from a [B, vocab_size, seqlen]
+        one-hot -- see tri_model/ETH_GBert.py and report §10 for the
+        original port of this fix; ported here unchanged since it is a
+        mathematically exact rewrite, not a model-architecture change:
+
+          X_dv[b,h,v] = sum_l 1[gcn_vocab_ids[b,l]==v] * words_embeddings[b,l,h]
+          (X_dv @ H_vh)[b,h,k] = sum_v X_dv[b,h,v] * H_vh[v,k]
+                               = sum_l words_embeddings[b,l,h] * H_vh[gcn_vocab_ids[b,l], k]
+
+        words_embeddings: [B, L, H_bert]
+        gcn_vocab_ids:    [B, L] long, -1 where the token has no vocab-graph node
+        """
+        valid_mask = (gcn_vocab_ids >= 0).unsqueeze(-1).to(words_embeddings.dtype)  # [B, L, 1]
+        safe_ids = gcn_vocab_ids.clamp(min=0)                                        # [B, L]
+
         for i in range(self.num_adj):
-            # H_vh = vocab_adj_list[i].mm(getattr(self, "W%d_vh" % i))
             if not isinstance(vocab_adj_list[i], torch.Tensor) or not vocab_adj_list[i].is_sparse:
                 raise TypeError("Expected a PyTorch sparse tensor")
-            H_vh = torch.sparse.mm(vocab_adj_list[i].float(), getattr(self, "W%d_vh" % i))
+            W_i = getattr(self, "W%d_vh" % i)
+            H_vh = torch.sparse.mm(vocab_adj_list[i].float(), W_i)  # [vocab_size, hid_dim] -- one-time, small
 
-            # H_vh=self.dropout(F.elu(H_vh))
             H_vh = self.dropout(H_vh)
-            H_dh = X_dv.matmul(H_vh)
+            H_vh_gathered = H_vh[safe_ids] * valid_mask             # [B, L, hid_dim]
+            H_dh = torch.einsum("blh,blk->bhk", words_embeddings, H_vh_gathered)  # [B, H_bert, hid_dim]
 
             if add_linear_mapping_term:
-                H_linear = X_dv.matmul(getattr(self, "W%d_vh" % i))
+                W_gathered = W_i[safe_ids] * valid_mask              # [B, L, hid_dim]
+                H_linear = torch.einsum("blh,blk->bhk", words_embeddings, W_gathered)
                 H_linear = self.dropout(H_linear)
-                H_dh += H_linear
+                H_dh = H_dh + H_linear
 
             if i == 0:
                 fused_H = H_dh
@@ -138,11 +156,11 @@ class ETH_GBertEmbeddings(BertEmbeddings):
 
         self.dynamic_fusion_layer = DynamicFusionLayer(config.hidden_size)
 
-    def forward(self, vocab_adj_list, gcn_swop_eye, input_ids, token_type_ids=None, attention_mask=None):
+    def forward(self, vocab_adj_list, gcn_vocab_ids, input_ids, token_type_ids=None, attention_mask=None):
         words_embeddings = self.word_embeddings(input_ids)
 
-        vocab_input = gcn_swop_eye.matmul(words_embeddings).transpose(1, 2)
-        gcn_vocab_out = self.vocab_gcn(vocab_adj_list, vocab_input)
+        # Sparse gather -- see VocabGraphConvolution.forward
+        gcn_vocab_out = self.vocab_gcn(vocab_adj_list, words_embeddings, gcn_vocab_ids)
 
         gcn_words_embeddings = words_embeddings.clone()
         for i in range(self.gcn_embedding_dim):
@@ -197,7 +215,7 @@ class ETH_GBertModel(BertModel):
     def forward(
             self,
             vocab_adj_list,
-            gcn_swop_eye,
+            gcn_vocab_ids,
             input_ids,
             token_type_ids=None,
             attention_mask=None,
@@ -211,7 +229,7 @@ class ETH_GBertModel(BertModel):
 
         embedding_output = self.embeddings(
             vocab_adj_list,
-            gcn_swop_eye,
+            gcn_vocab_ids,
             input_ids,
             token_type_ids,
             attention_mask,

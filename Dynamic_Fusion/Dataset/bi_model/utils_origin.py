@@ -243,7 +243,6 @@ class CorpusDataset(Dataset):
 
     # @classmethod
     def pad(self, batch):
-        gcn_vocab_size = len(self.gcn_vocab_map)
         seqlen_list = [len(sample[0]) for sample in batch]
         maxlen = np.array(seqlen_list).max()
 
@@ -261,13 +260,21 @@ class CorpusDataset(Dataset):
         batch_segment_ids = torch.tensor(f_pad(2, maxlen), dtype=torch.long)
         batch_confidences = torch.tensor(f_collect(3), dtype=torch.float)
         batch_label_ids = torch.tensor(f_collect(4), dtype=torch.long)
-        batch_gcn_vocab_ids_paded = np.array(f_pad2(5, maxlen)).reshape(-1)
-        batch_gcn_swop_eye = torch.eye(gcn_vocab_size + 1)[
-            batch_gcn_vocab_ids_paded
-        ][:, :-1]
-        batch_gcn_swop_eye = batch_gcn_swop_eye.view(
-            len(batch), -1, gcn_vocab_size
-        ).transpose(1, 2)
+        # Sparse gather/embedding-lookup representation (replaces the dense
+        # one-hot "gcn_swop_eye" this function used to build via
+        # torch.eye(gcn_vocab_size + 1)[...] -- that line alone allocates a
+        # full (vocab_size+1) x (vocab_size+1) matrix EVERY batch just to
+        # index one row out of it (~4.9 GB at this corpus's 35,000-vocab,
+        # rebuilt from scratch on every collate_fn call), before even getting
+        # to the [B, vocab_size, seqlen] scatter tensor consumed downstream.
+        # -1 marks "no vocab-graph node at this position" (padding/non-
+        # address token); ETH_GBert_origin.py's VocabGraphConvolution now
+        # gathers the relevant [vocab_size, hid_dim] row per token instead of
+        # scattering every token into a dense per-vocab-id slot --
+        # mathematically identical, O(batch*seqlen) memory instead of
+        # O(batch*vocab_size*seqlen) (see tri_model/utils.py's CorpusDataset.pad
+        # and report §10 for the original port of this fix).
+        batch_gcn_vocab_ids = torch.tensor(f_pad2(5, maxlen), dtype=torch.long)
 
         return (
             batch_input_ids,
@@ -275,5 +282,5 @@ class CorpusDataset(Dataset):
             batch_segment_ids,
             batch_confidences,
             batch_label_ids,
-            batch_gcn_swop_eye,
+            batch_gcn_vocab_ids,
         )

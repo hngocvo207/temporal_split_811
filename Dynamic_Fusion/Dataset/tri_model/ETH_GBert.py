@@ -70,7 +70,30 @@ class VocabGraphConvolution(nn.Module):
             ):
                 init.kaiming_uniform_(p, a=math.sqrt(5))
 
-    def forward(self, vocab_adj_list, words_embeddings, gcn_vocab_ids, add_linear_mapping_term=False):
+    def compute_H_vh(self, vocab_adj_list):
+        """H_vh = dropout(sparse_mm(adj, W)) for every adjacency in
+        vocab_adj_list -- the one genuinely batch-invariant piece of
+        forward(). Adjacency and weights are frozen for an entire eval()
+        pass (model.eval() + torch.no_grad(), same vocab_adj_list argument
+        on every call), so this only needs to run ONCE per evaluate() call,
+        not once per batch. Call this before the batch loop and pass the
+        result to forward(precomputed_H_vh=...) -- see full_scale_test_eval
+        _report.md: recomputing this per-batch across ~101k batches (8
+        examples/batch over 811,704 accounts) was the dominant cost of the
+        213-minute full-scale eval run.
+
+        Returns a list of [vocab_size, hid_dim] tensors, one per adjacency.
+        """
+        H_vh_list = []
+        for i in range(self.num_adj):
+            if not isinstance(vocab_adj_list[i], torch.Tensor) or not vocab_adj_list[i].is_sparse:
+                raise TypeError("Expected a PyTorch sparse tensor")
+            W_i = getattr(self, "W%d_vh" % i)
+            H_vh = torch.sparse.mm(vocab_adj_list[i].float(), W_i)  # [vocab_size, hid_dim]
+            H_vh_list.append(self.dropout(H_vh))
+        return H_vh_list
+
+    def forward(self, vocab_adj_list, words_embeddings, gcn_vocab_ids, add_linear_mapping_term=False, precomputed_H_vh=None):
         """Sparse gather/embedding-lookup form (replaces the dense one-hot
         "gcn_swop_eye" scatter-matmul: X_dv.matmul(H_vh) where X_dv was a
         [B, H_bert, vocab_size] tensor built from a [B, vocab_size, seqlen]
@@ -87,21 +110,29 @@ class VocabGraphConvolution(nn.Module):
 
         words_embeddings: [B, L, H_bert]
         gcn_vocab_ids:    [B, L] long, -1 where the token has no vocab-graph node
+        precomputed_H_vh: optional list of tensors from compute_H_vh(), one
+            per adjacency -- when given, skips the sparse_mm(adj, W) below
+            (use this during eval; see compute_H_vh's docstring). Leave None
+            during training, where W_i changes every optimizer step.
         """
         valid_mask = (gcn_vocab_ids >= 0).unsqueeze(-1).to(words_embeddings.dtype)  # [B, L, 1]
         safe_ids = gcn_vocab_ids.clamp(min=0)                                        # [B, L]
 
         for i in range(self.num_adj):
-            if not isinstance(vocab_adj_list[i], torch.Tensor) or not vocab_adj_list[i].is_sparse:
-                raise TypeError("Expected a PyTorch sparse tensor")
-            W_i = getattr(self, "W%d_vh" % i)
-            H_vh = torch.sparse.mm(vocab_adj_list[i].float(), W_i)  # [vocab_size, hid_dim] -- one-time, small
+            if precomputed_H_vh is not None:
+                H_vh = precomputed_H_vh[i]
+            else:
+                if not isinstance(vocab_adj_list[i], torch.Tensor) or not vocab_adj_list[i].is_sparse:
+                    raise TypeError("Expected a PyTorch sparse tensor")
+                W_i = getattr(self, "W%d_vh" % i)
+                H_vh = torch.sparse.mm(vocab_adj_list[i].float(), W_i)  # [vocab_size, hid_dim] -- one-time, small
+                H_vh = self.dropout(H_vh)
 
-            H_vh = self.dropout(H_vh)
             H_vh_gathered = H_vh[safe_ids] * valid_mask             # [B, L, hid_dim]
             H_dh = torch.einsum("blh,blk->bhk", words_embeddings, H_vh_gathered)  # [B, H_bert, hid_dim]
 
             if add_linear_mapping_term:
+                W_i = getattr(self, "W%d_vh" % i)
                 W_gathered = W_i[safe_ids] * valid_mask              # [B, L, hid_dim]
                 H_linear = torch.einsum("blh,blk->bhk", words_embeddings, W_gathered)
                 H_linear = self.dropout(H_linear)
@@ -356,12 +387,13 @@ class ETH_GBertEmbeddings(BertEmbeddings):
         graph_features,              # [B, num_graph_features]
         token_type_ids=None,
         attention_mask=None,
+        precomputed_H_vh=None,
     ):
         # BERT word embeddings
         words_embeddings = self.word_embeddings(input_ids)   # [B, seq_len, hidden]
 
         # GCN-enhanced embeddings (sparse gather -- see VocabGraphConvolution.forward)
-        gcn_vocab_out = self.vocab_gcn(vocab_adj_list, words_embeddings, gcn_vocab_ids)
+        gcn_vocab_out = self.vocab_gcn(vocab_adj_list, words_embeddings, gcn_vocab_ids, precomputed_H_vh=precomputed_H_vh)
 
         gcn_words_embeddings = words_embeddings.clone()
         for i in range(self.gcn_embedding_dim):
@@ -427,6 +459,14 @@ class ETH_GBertModel(BertModel):
         self.all_cls_states = []
         self.apply(self.init_bert_weights)
 
+    def compute_gcn_H_vh(self, vocab_adj_list):
+        """See VocabGraphConvolution.compute_H_vh -- call once before an
+        eval batch loop (model.eval() + torch.no_grad(), adjacency/weights
+        frozen for the whole pass) and pass the result to forward(
+        precomputed_H_vh=...) for every batch, instead of letting each
+        forward() call recompute the same sparse_mm(adj, W)."""
+        return self.embeddings.vocab_gcn.compute_H_vh(vocab_adj_list)
+
     def forward(
         self,
         vocab_adj_list,
@@ -437,6 +477,7 @@ class ETH_GBertModel(BertModel):
         attention_mask=None,
         output_all_encoded_layers=False,
         head_mask=None,
+        precomputed_H_vh=None,
     ):
         if token_type_ids is None:
             token_type_ids = torch.zeros_like(input_ids)
@@ -451,6 +492,7 @@ class ETH_GBertModel(BertModel):
             graph_features,              # ← Truyền feature vào embedding
             token_type_ids,
             attention_mask,
+            precomputed_H_vh=precomputed_H_vh,
         )
 
         # Extended attention mask

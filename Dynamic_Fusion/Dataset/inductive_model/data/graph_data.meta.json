@@ -1,0 +1,22 @@
+{
+  "index_convention": "same node index space as address_to_index.pkl / node_features_all23.pt",
+  "directed": true,
+  "edge_weight_note": "raw weights carried over unchanged from mg_graph_weight_formula.py output; wide dynamic range (0 to ~6.8e12) -- B1 must normalize/log-transform before using as GNN edge weights, not done here.",
+  "train_subset_of_inference": true,
+  "splits": {
+    "train": {
+      "num_nodes": 2973489,
+      "num_edges": 4162599,
+      "edge_weight_min": 0.0,
+      "edge_weight_max": 6793974513664.0,
+      "source_npz": "data/preprocessed/Dataset_MG/adj_train.npz"
+    },
+    "inference": {
+      "num_nodes": 2973489,
+      "num_edges": 5355155,
+      "edge_weight_min": 0.0,
+      "edge_weight_max": 6796046499840.0,
+      "source_npz": "data/preprocessed/Dataset_MG/adj_inference.npz"
+    }
+  }
+}

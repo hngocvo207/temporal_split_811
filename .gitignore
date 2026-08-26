@@ -20,6 +20,8 @@ logs/
 scratch_logs/
 **/scratch_logs/
 dynamic_fusion_leakage_audit/scratch_logs/
+runs/
+**/runs/
 wandb/
 **/wandb/
 
