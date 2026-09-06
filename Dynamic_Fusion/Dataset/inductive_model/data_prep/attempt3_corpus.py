@@ -45,6 +45,8 @@ class Example:
     global_idx: int  # index trong address_to_index.pkl / node_features_all23.pt / graph_*.pt
     address: str
     split: str  # 'train' | 'val' | 'overlap' | 'pure_test'
+    label_strict: int = None  # nhan xac nhan doc lap (labels.pkl goc) khi khac `label`
+                               # -- xem data_prep/full_test_corpus.py; None neu khong ap dung
 
 
 def _load_pickle(name: str):

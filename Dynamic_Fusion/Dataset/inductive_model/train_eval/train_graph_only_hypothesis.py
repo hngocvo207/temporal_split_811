@@ -64,10 +64,15 @@ class GraphOnlyClassifier(nn.Module):
     """Không có nhánh text/fusion -- chỉ để kiểm chứng giả thuyết inductive
     của riêng nhánh graph (B1+B2), không phải kiến trúc cuối cùng."""
 
-    def __init__(self, in_channels=23, hidden=128, out=128, dropout=0.2):
+    def __init__(self, in_channels=23, hidden=128, out=128, dropout=0.2, mlp_classifier=False):
         super().__init__()
         self.encoder = GraphSAGEEncoder(in_channels, hidden_channels=hidden, out_channels=out, dropout=dropout)
-        self.classifier = nn.Linear(out, 2)
+        if mlp_classifier:
+            self.classifier = nn.Sequential(
+                nn.Linear(out, out // 2), nn.ReLU(), nn.Dropout(dropout), nn.Linear(out // 2, 2)
+            )
+        else:
+            self.classifier = nn.Linear(out, 2)
 
     def forward_subgraph(self, subgraph):
         h_all = self.encoder(subgraph.x, subgraph.edge_index, subgraph.edge_weight)
@@ -87,23 +92,36 @@ def make_epoch_batches(pos_idx: torch.Tensor, neg_idx: torch.Tensor, neg_ratio: 
     return [perm[i:i + batch_size] for i in range(0, perm.numel(), batch_size)]
 
 
-def train(args):
+def train(args, idx=None, labels=None, node_features=None, adj_train=None, verbose=True, wandb_run=None):
+    """args cần: epochs, batch_size, neg_ratio, lr, eval_every, weight_decay,
+    hidden, out, dropout, mlp_classifier, patience (early stop theo val AUPRC
+    -- CHỌN MODEL BẰNG VAL, KHÔNG BẰNG pure_test, để không "nhìn trộm" tập test
+    khi tune -- đúng tinh thần fix experimental definition nghiêm ngặt).
+
+    Trả về model ở checkpoint có val AUPRC TỐT NHẤT (không phải epoch cuối)."""
     torch.manual_seed(GLOBAL_SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device}")
 
-    idx, labels = build_partition_indices()
-    print({k: v.numel() for k, v in idx.items()})
-
-    node_features = load_node_features()
-    adj_train = sp.load_npz(PREPROC_DIR / "adj_train.npz")
+    if idx is None:
+        idx, labels = build_partition_indices()
+    if node_features is None:
+        node_features = load_node_features()
+    if adj_train is None:
+        adj_train = sp.load_npz(PREPROC_DIR / "adj_train.npz")
     sampler = LabelAwareNeighborSampler(adj_train, labels, seed=GLOBAL_SEED)
 
-    model = GraphOnlyClassifier().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    model = GraphOnlyClassifier(
+        hidden=args.hidden, out=args.out, dropout=args.dropout, mlp_classifier=args.mlp_classifier
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     rng = torch.Generator().manual_seed(GLOBAL_SEED)
 
+    best_val_auprc = -1.0
+    best_state = None
+    best_epoch = -1
+    epochs_since_improve = 0
     history = []
+
     for epoch in range(args.epochs):
         model.train()
         t0 = time.time()
@@ -124,25 +142,67 @@ def train(args):
 
         dt = time.time() - t0
         avg_loss = total_loss / len(batches)
-        log = {"epoch": epoch, "train_loss": avg_loss, "n_batches": len(batches), "time_s": dt}
+        log = {"epoch": epoch, "train_loss": avg_loss, "time_s": dt}
+        if wandb_run is not None:
+            wandb_run.log({"train_loss": avg_loss, "epoch_time_s": dt}, step=epoch)
 
         if (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1:
             metrics = evaluate(model, idx, labels, device)
             log["eval"] = metrics
-            print(f"epoch={epoch} loss={avg_loss:.4f} time={dt:.1f}s eval={metrics}")
-        else:
+            val_auprc = metrics["val"]["auprc"]
+            improved = val_auprc > best_val_auprc
+            if improved:
+                best_val_auprc = val_auprc
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_epoch = epoch
+                epochs_since_improve = 0
+            else:
+                epochs_since_improve += args.eval_every
+            if wandb_run is not None:
+                flat = {f"{split}/{k}": v for split, m in metrics.items() for k, v in m.items()}
+                wandb_run.log({**flat, "best_val_auprc_so_far": best_val_auprc}, step=epoch)
+            if verbose:
+                print(f"epoch={epoch} loss={avg_loss:.4f} time={dt:.1f}s val_auprc={val_auprc:.4f}"
+                      f"{' *best*' if improved else ''}")
+            if args.patience and epochs_since_improve >= args.patience:
+                if verbose:
+                    print(f"early stop at epoch={epoch} (no val AUPRC improvement for {args.patience} epochs)")
+                break
+        elif verbose:
             print(f"epoch={epoch} loss={avg_loss:.4f} time={dt:.1f}s")
         history.append(log)
 
-    return model, history, idx, labels
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, history, idx, labels, best_epoch, best_val_auprc
+
+
+_GRAPH_INFERENCE_CACHE = None
+
+
+def _get_graph_inference():
+    # Nạp 1 lần, dùng lại cho mọi lần eval (được gọi rất nhiều lần trong sweep)
+    # thay vì đọc lại file .pt 364MB từ đĩa mỗi lần.
+    global _GRAPH_INFERENCE_CACHE
+    if _GRAPH_INFERENCE_CACHE is None:
+        _GRAPH_INFERENCE_CACHE = load_graph("inference")
+    return _GRAPH_INFERENCE_CACHE
 
 
 @torch.no_grad()
 def evaluate(model: GraphOnlyClassifier, idx: dict, labels: torch.Tensor, device: torch.device) -> dict:
     model.eval()
-    graph_inference = load_graph("inference")
-    logits_all = model.full_graph_logits(graph_inference, device)  # [N, 2], no_grad, full adj_inference
-    probs_all = torch.softmax(logits_all, dim=-1)[:, 1].cpu().numpy()
+    # full_graph_forward ở hidden lớn (vd 256) + model khác đồng thời có thể
+    # còn activation/optimizer trên GPU -> OOM thật đã tự bắt được lúc sweep
+    # (12GB không đủ). Chạy trên CPU: encoder rất nhỏ (vài trăm nghìn tham số),
+    # chuyển qua lại gần như miễn phí, còn forward mất vài giây -- chấp nhận
+    # được vì evaluate() không phải hot loop.
+    original_device = next(model.parameters()).device
+    model.to("cpu")
+    graph_inference = _get_graph_inference()
+    logits_all = model.full_graph_logits(graph_inference, torch.device("cpu"))
+    model.to(original_device)
+    probs_all = torch.softmax(logits_all, dim=-1)[:, 1].numpy()
 
     results = {}
     for split in ("val", "overlap", "pure_test"):
@@ -177,6 +237,12 @@ def main():
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--neg-ratio", type=int, default=3)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--weight-decay", type=float, default=0.0)
+    ap.add_argument("--hidden", type=int, default=128)
+    ap.add_argument("--out", type=int, default=128)
+    ap.add_argument("--dropout", type=float, default=0.2)
+    ap.add_argument("--mlp-classifier", action="store_true")
+    ap.add_argument("--patience", type=int, default=0, help="0 = tắt early stopping")
     ap.add_argument("--eval-every", type=int, default=5)
     args = ap.parse_args()
 
@@ -186,15 +252,17 @@ def main():
     baselines = naive_baselines(idx, labels)
     print(json.dumps(baselines, indent=2))
 
-    model, history, idx, labels = train(args)
-    final_eval = evaluate(model, idx, labels, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    model, history, idx, labels, best_epoch, best_val_auprc = train(args)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    final_eval = evaluate(model, idx, labels, device)
 
-    print("\n=== FINAL RESULT ===")
+    print(f"\n=== FINAL RESULT (model = best val AUPRC checkpoint, epoch {best_epoch}) ===")
     print(json.dumps(final_eval, indent=2))
     print("\npure_test = bài test inductive THẬT (0 cạnh train-time) -- đây là con số quyết định giả thuyết.")
 
     with open(OUTPUT_DIR / "graph_only_hypothesis_result.json", "w") as f:
         json.dump({"baselines": baselines, "history": history, "final_eval": final_eval,
+                   "best_epoch": best_epoch, "best_val_auprc": best_val_auprc,
                    "args": vars(args)}, f, indent=2)
     torch.save(model.state_dict(), OUTPUT_DIR / "graph_only_hypothesis_model.pt")
 
