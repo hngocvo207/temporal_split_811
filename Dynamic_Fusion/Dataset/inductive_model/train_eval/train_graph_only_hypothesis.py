@@ -38,6 +38,8 @@ import scipy.sparse as sp
 import torch
 import torch.nn as nn
 
+import pickle
+
 from data_prep.io_utils import load_graph, load_node_features
 from data_prep.labels_io import PREPROC_DIR, load_labels, load_partition
 from model.gnn_encoder import GraphSAGEEncoder
@@ -49,14 +51,51 @@ OUTPUT_DIR = Path(__file__).resolve().parents[1] / "output"
 GLOBAL_SEED = 44
 
 
-def build_partition_indices():
-    labels = load_labels()
-    partition = np.array(load_partition())
+def _load_labels_partition_from_dir(split_dir: Path):
+    """Ban tong quat cua load_labels()/load_partition() (data_prep/labels_io.py)
+    -- cho phep tro toi 1 thu muc split KHAC PREPROC_DIR mac dinh (vd
+    data/preprocessed/Dataset_MG_v3_no_overlap/), dung rieng cho script nay de
+    KHONG doi hanh vi cua moi script khac dang import PREPROC_DIR toan cuc
+    (train_e2*.py, pretrain_graph_encoder.py... van phai dung dung split cu
+    cho toi khi corpus BERT cua chung duoc build lai cho split moi -- xem
+    STATUS.md)."""
+    with open(split_dir / "address_to_index.pkl", "rb") as f:
+        addr_to_idx = pickle.load(f)
+    n = len(addr_to_idx)
+    with open(split_dir / "labels.pkl", "rb") as f:
+        labels_by_addr = pickle.load(f)
+    labels = torch.zeros(n, dtype=torch.long)
+    for addr, lbl in labels_by_addr.items():
+        labels[addr_to_idx[addr]] = int(lbl)
+    with open(split_dir / "partition.pkl", "rb") as f:
+        partition_by_addr = pickle.load(f)
+    partition = [None] * n
+    for addr, split in partition_by_addr.items():
+        partition[addr_to_idx[addr]] = split
+    return labels, partition
+
+
+def build_partition_indices(split_dir: Path = None):
+    """split_dir=None (mac dinh) -> hanh vi CU, dung PREPROC_DIR toan cuc
+    (data/preprocessed/Dataset_MG, 4 nhom train/val/overlap/pure_test).
+    split_dir=<path> -> doc truc tiep tu thu muc do (vd split v3 3 nhom
+    train/val/test, KHONG overlap). Ten cac nhom eval (khac 'train'/'isolated')
+    duoc PHAT HIEN TU DONG tu chinh partition.pkl, khong hard-code, de dung
+    duoc voi ca 2 kien truc split."""
+    if split_dir is None:
+        labels = load_labels()
+        partition = np.array(load_partition())
+    else:
+        labels, partition = _load_labels_partition_from_dir(Path(split_dir))
+        partition = np.array(partition)
+
+    all_splits = sorted(set(partition.tolist()) - {"train", "isolated", None})
     idx = {}
-    for split in ("train", "val", "overlap", "pure_test"):
+    for split in ["train"] + all_splits:
         mask = partition == split
         idx[f"{split}_pos"] = torch.tensor(np.where(mask & (labels.numpy() == 1))[0], dtype=torch.long)
         idx[f"{split}_neg"] = torch.tensor(np.where(mask & (labels.numpy() == 0))[0], dtype=torch.long)
+    idx["_eval_splits"] = all_splits  # vd ['overlap','pure_test','val'] (cu) hoac ['test','val'] (v3)
     return idx, labels
 
 
@@ -92,22 +131,28 @@ def make_epoch_batches(pos_idx: torch.Tensor, neg_idx: torch.Tensor, neg_ratio: 
     return [perm[i:i + batch_size] for i in range(0, perm.numel(), batch_size)]
 
 
-def train(args, idx=None, labels=None, node_features=None, adj_train=None, verbose=True, wandb_run=None):
+def train(args, idx=None, labels=None, node_features=None, adj_train=None, verbose=True, wandb_run=None,
+          split_dir: Path = None):
     """args cần: epochs, batch_size, neg_ratio, lr, eval_every, weight_decay,
     hidden, out, dropout, mlp_classifier, patience (early stop theo val AUPRC
-    -- CHỌN MODEL BẰNG VAL, KHÔNG BẰNG pure_test, để không "nhìn trộm" tập test
-    khi tune -- đúng tinh thần fix experimental definition nghiêm ngặt).
+    -- CHỌN MODEL BẰNG VAL, KHÔNG BẰNG pure_test/test, để không "nhìn trộm" tập
+    test khi tune -- đúng tinh thần fix experimental definition nghiêm ngặt).
+
+    split_dir=None (mặc định) -> split CŨ (PREPROC_DIR toàn cục). Truyền vào
+    1 Path (vd data/preprocessed/Dataset_MG_v3_no_overlap) để dùng split MỚI
+    (3 nhóm train/val/test, không overlap) -- xem build_partition_indices().
 
     Trả về model ở checkpoint có val AUPRC TỐT NHẤT (không phải epoch cuối)."""
     torch.manual_seed(GLOBAL_SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if idx is None:
-        idx, labels = build_partition_indices()
+        idx, labels = build_partition_indices(split_dir=split_dir)
     if node_features is None:
         node_features = load_node_features()
     if adj_train is None:
-        adj_train = sp.load_npz(PREPROC_DIR / "adj_train.npz")
+        adj_dir = Path(split_dir) if split_dir is not None else PREPROC_DIR
+        adj_train = sp.load_npz(adj_dir / "adj_train.npz")
     sampler = LabelAwareNeighborSampler(adj_train, labels, seed=GLOBAL_SEED)
 
     model = GraphOnlyClassifier(
@@ -190,7 +235,9 @@ def _get_graph_inference():
 
 
 @torch.no_grad()
-def evaluate(model: GraphOnlyClassifier, idx: dict, labels: torch.Tensor, device: torch.device) -> dict:
+def evaluate(model: GraphOnlyClassifier, idx: dict, labels: torch.Tensor, device: torch.device,
+             eval_splits=None) -> dict:
+    eval_splits = eval_splits if eval_splits is not None else idx.get("_eval_splits", ["val", "overlap", "pure_test"])
     model.eval()
     # full_graph_forward ở hidden lớn (vd 256) + model khác đồng thời có thể
     # còn activation/optimizer trên GPU -> OOM thật đã tự bắt được lúc sweep
@@ -205,24 +252,25 @@ def evaluate(model: GraphOnlyClassifier, idx: dict, labels: torch.Tensor, device
     probs_all = torch.softmax(logits_all, dim=-1)[:, 1].numpy()
 
     results = {}
-    for split in ("val", "overlap", "pure_test"):
+    for split in eval_splits:
         pos = idx[f"{split}_pos"]
         neg = idx[f"{split}_neg"]
         split_idx = torch.cat([pos, neg]).numpy()
         y_true = labels[split_idx].numpy()
         y_prob = probs_all[split_idx]
-        results[split] = compute_metrics(y_true, y_prob)
+        results[split] = compute_metrics(y_true, y_prob, k_list=[1000])
     return results
 
 
 @torch.no_grad()
-def naive_baselines(idx: dict, labels: torch.Tensor) -> dict:
+def naive_baselines(idx: dict, labels: torch.Tensor, eval_splits=None) -> dict:
     """Sàn tham chiếu: score ngẫu nhiên uniform -- AUPRC kỳ vọng ~ tỉ lệ dương
     (prevalence), F1(pos) của "luôn đoán âm" = 0. Dùng để không ảo tưởng nếu
     con số eval nhìn "cao" nhưng thực ra dễ đạt vì lớp dương siêu hiếm."""
+    eval_splits = eval_splits if eval_splits is not None else idx.get("_eval_splits", ["val", "overlap", "pure_test"])
     out = {}
     rng = np.random.default_rng(GLOBAL_SEED)
-    for split in ("val", "overlap", "pure_test"):
+    for split in eval_splits:
         pos, neg = idx[f"{split}_pos"], idx[f"{split}_neg"]
         n_pos, n = pos.numel(), pos.numel() + neg.numel()
         y_true = np.concatenate([np.ones(n_pos), np.zeros(neg.numel())])
@@ -244,27 +292,38 @@ def main():
     ap.add_argument("--mlp-classifier", action="store_true")
     ap.add_argument("--patience", type=int, default=0, help="0 = tắt early stopping")
     ap.add_argument("--eval-every", type=int, default=5)
+    ap.add_argument("--split-dir", type=str, default=None,
+                     help="mac dinh None = split CU (PREPROC_DIR). Truyen "
+                          "data/preprocessed/Dataset_MG_v3_no_overlap de dung split MOI "
+                          "(train/val/test, khong overlap) -- xem STATUS.md")
+    ap.add_argument("--output-suffix", type=str, default="",
+                     help="hau to ten file output (vd '_v3') de khong ghi de ket qua split cu")
     args = ap.parse_args()
+    split_dir = Path(args.split_dir) if args.split_dir else None
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    idx, labels = build_partition_indices()
+    idx, labels = build_partition_indices(split_dir=split_dir)
+    eval_splits = idx["_eval_splits"]
+    print(f"split_dir={split_dir or PREPROC_DIR}  eval_splits={eval_splits}")
     print("naive baselines (random score, sanity floor):")
-    baselines = naive_baselines(idx, labels)
+    baselines = naive_baselines(idx, labels, eval_splits=eval_splits)
     print(json.dumps(baselines, indent=2))
 
-    model, history, idx, labels, best_epoch, best_val_auprc = train(args)
+    model, history, idx, labels, best_epoch, best_val_auprc = train(args, split_dir=split_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    final_eval = evaluate(model, idx, labels, device)
+    final_eval = evaluate(model, idx, labels, device, eval_splits=eval_splits)
 
     print(f"\n=== FINAL RESULT (model = best val AUPRC checkpoint, epoch {best_epoch}) ===")
     print(json.dumps(final_eval, indent=2))
-    print("\npure_test = bài test inductive THẬT (0 cạnh train-time) -- đây là con số quyết định giả thuyết.")
+    strict_test_name = "test" if "test" in eval_splits else "pure_test"
+    print(f"\n{strict_test_name} = bài test inductive THẬT (0 cạnh train-time) -- đây là con số quyết định giả thuyết.")
 
-    with open(OUTPUT_DIR / "graph_only_hypothesis_result.json", "w") as f:
+    suffix = args.output_suffix
+    with open(OUTPUT_DIR / f"graph_only_hypothesis_result{suffix}.json", "w") as f:
         json.dump({"baselines": baselines, "history": history, "final_eval": final_eval,
                    "best_epoch": best_epoch, "best_val_auprc": best_val_auprc,
-                   "args": vars(args)}, f, indent=2)
-    torch.save(model.state_dict(), OUTPUT_DIR / "graph_only_hypothesis_model.pt")
+                   "split_dir": str(split_dir or PREPROC_DIR), "args": vars(args)}, f, indent=2)
+    torch.save(model.state_dict(), OUTPUT_DIR / f"graph_only_hypothesis_model{suffix}.pt")
 
 
 if __name__ == "__main__":

@@ -1028,8 +1028,400 @@ về việc ghép có thực sự cải thiện so với raw23 riêng lẻ hay k
 Kết quả đầy đủ: `output/gbm_handcrafted_graph_result_v2.json`,
 `output/handcrafted_graph_features.npy` (9 cột, N=2,973,489).
 
+## BUG QUAN TRỌNG: lệch hướng cạnh giữa train và eval của toàn bộ nhánh graph (2026-09-06)
+
+**Phát hiện** (theo yêu cầu rà soát): `model/graph_sampling.py::sample_union_subgraph`
+(dùng bởi B2 `LabelAwareNeighborSampler` — train, B3 `ego_subgraph` — inference
+1 account, và `pretrain_graph_encoder.py` — GraphMAE) và `full_graph_forward()`
+(dùng bởi **MỌI** `evaluate()`/eval hàng loạt trong E2/E2v2/E2v3/ablation/
+GraphMAE-embedding-extraction đã làm) dùng **HAI QUY ƯỚC HƯỚNG CẠNH NGƯỢC NHAU**:
+
+- `adj_csr[i,j] != 0` nghĩa là **i gửi tiền cho j** (row=from_addr, col=to_addr
+  — xác nhận từ `mg_build_adjacency.py`).
+- `sample_union_subgraph`: center aggregate từ `adj_csr[center,:]` — tức từ
+  **người center ĐÃ GỬI TIỀN CHO** (payee/out-neighbor).
+- `full_graph_forward` (trước fix): dùng thẳng `edge_index=[coo.row, coo.col]`
+  từ `graph_train.pt`/`graph_inference.pt` → node v aggregate từ
+  `edge_index[0]` tại vị trí `edge_index[1]==v`, tức từ **người ĐÃ GỬI TIỀN
+  CHO v** (payer/in-neighbor) — **NGƯỢC HẲN** quy ước train.
+
+**Hệ quả**: mọi checkpoint (GraphMAE pretrain, GraphSAGE trong E2/v2/v3, graph-only
+hypothesis, sweep) đều TRAIN đúng theo quy ước payee (không bị ảnh hưởng, vì train
+luôn qua `sample_union_subgraph`) — nhưng **MỌI con số eval/suy luận hàng loạt đã
+báo cáo trong toàn bộ investigate này** (E2 v2 full pure_test AUPRC=0.019,
+matched-pool 0.105/0.046, learning curve trên fusion, embedding GraphMAE
+đóng băng→GBM...) đều tính `h_graph` với hướng cạnh SAI (payer thay vì payee) —
+KHÔNG khớp với những gì encoder thực sự học được lúc train.
+
+**Quyết định sửa**: chọn quy ước của `sample_union_subgraph` (payee) làm chuẩn —
+**không phải vì nó đúng hơn về domain** (cả 2 hướng đều có tín hiệu fraud thật:
+nạn nhân gửi tiền CHO phisher = payer-signal; phisher gửi tiền ĐI để rửa tiền =
+payee-signal — không có câu trả lời domain rõ ràng) — mà vì **mọi checkpoint đã
+train từ đầu dự án đều học theo quy ước này**, sửa phía eval để khớp tránh phải
+train lại toàn bộ (GraphMAE pretrain 2.97M node, BERT+GraphSAGE E2/v2/v3...).
+Đã ghi đầy đủ lý do vào `data/graph_data.meta.json` field
+`edge_direction_convention` (kèm cảnh báo đây là lựa chọn thực dụng, không phải
+khẳng định "payee là hướng đúng duy nhất").
+
+**Fix**: `data_prep/build_graph_data.py::csr_to_pyg_data` — đổi
+`edge_index=[coo.row, coo.col]` thành `[coo.col, coo.row]`. Build lại
+`graph_train.pt`/`graph_inference.pt` từ `adj_train.npz`/`adj_inference.npz`
+gốc (deterministic, không mất dữ liệu). **Assert chống tái diễn**:
+`data_prep/verify_edge_direction_consistency.py` — đối chiếu tập "nguồn
+aggregate" của `sample_union_subgraph` vs `full_graph_forward` trên 100 node
+ngẫu nhiên, cả `train` và `inference` graph. **Đã chạy, PASS 100/100 cả hai.**
+
+**Việc cần làm tiếp (đang chạy)**: chạy lại `eval_full_test.py` với
+`e2_v2_best_checkpoint.pt` (checkpoint CŨ, không cần train lại — chỉ eval lại
+với `graph_inference.pt` đã sửa) trên FULL pure_test/overlap để biết con số
+AUPRC=0.019 có đổi không — đang chạy trong tmux `e2_v2_eval_fixed`, kết quả
+lưu `output/e2_v2_full_eval_result_FIXED_EDGEDIR.json`. **CẢNH BÁO: kết luận
+"fusion thua GBM 8×, signal-limited không phải data-limited" ở các mục trên
+được rút ra TỪ SỐ LIỆU BỊ ẢNH HƯỞNG BỞI BUG NÀY — cần xác nhận lại sau khi có
+kết quả eval đã sửa, TRƯỚC KHI coi các kết luận đó là chốt.**
+
+### SỬA LẠI LẦN 2 — đảo ngược quyết định trên, theo chuẩn HGT (cùng ngày 2026-09-06)
+
+Sau khi rà soát lại theo đúng quy trình chuẩn GNN (đối chiếu paper **Heterogeneous
+Graph Transformer**, Hu et al. 2020, WWW'20 — `heterogeneous graph transformer.pdf`):
+**Definition 2/Eq.1**: `H[t] ← Aggregate_{s∈N(t)}(...)`, `N(t)` = các **source node**
+có cạnh `s→t` — tức target LUÔN aggregate từ nguồn TRỎ VÀO nó (incoming). Đây là
+chuẩn GNN thông thường (GCN/GraphSAGE/GAT/HGT đều vậy), không phải lựa chọn tuỳ ý.
+
+**Quyết định LẦN 1 ở trên (chọn payee/outgoing làm chuẩn) đã SAI theo chuẩn này —
+đảo ngược lại**: `full_graph_forward`/`graph_train.pt`/`graph_inference.pt` giữ
+**NGUYÊN BẢN GỐC** `edge_index=[coo.row, coo.col]` (không đổi gì, revert lại
+đúng như trước khi có bug) — target aggregate từ payer (đúng chuẩn incoming).
+Thay vào đó, **sửa phía `sample_union_subgraph`'s CALLERS** (không sửa chính
+`sample_union_subgraph`/`_neighbors` — đổi tên biến `edge_src`/`edge_dst`
+KHÔNG đủ, vì `_neighbors()` luôn đọc HÀNG của center trong CSR bất kể gán vai
+trò nào; phải TRANSPOSE ma trận đầu vào để hàng của center trở thành payer
+thật): `model/label_aware_sampler.py` (`LabelAwareNeighborSampler.__init__`),
+`model/ego_subgraph.py` (`build_ego_subgraph`), `model/case_b_subgraph.py`
+(`build_case_b_subgraph`), `train_eval/pretrain_graph_encoder.py` — cả 4 nơi
+đều thêm `.T.tocsr()` khi nạp `adj_train`/`adj_inference`.
+
+`data_prep/verify_edge_direction_consistency.py` viết lại để gọi THẲNG hàm
+`_neighbors()` thật trên ma trận đã transpose, đối chiếu với `full_graph_forward`
+— **PASS 100/100 cả train và inference graph** với quy ước đã sửa đúng.
+`data/graph_data.meta.json` cập nhật lại lý do đầy đủ (field
+`edge_direction_convention`, có `revision_history` ngầm qua `why_this_direction`).
+
+**HỆ QUẢ NGHIÊM TRỌNG HƠN LẦN SỬA TRƯỚC**: lần sửa này thay đổi **CHÍNH VIỆC
+SAMPLE LÚC TRAIN** (không chỉ eval) — `sample_union_subgraph` giờ lấy đúng
+payer thay vì payee cho MỌI lần gọi, kể cả trong vòng lặp train thật. Nghĩa là
+**MỌI checkpoint đã train trước ngày 2026-09-06** (GraphMAE pretrain,
+GraphSAGE trong E2/E2v2/E2v3, graph-only hypothesis, sweep, ablation) đều học
+theo quy ước payee CŨ — **không còn khớp với quy ước payer hiện tại, cần TRAIN
+LẠI TỪ ĐẦU mới có kết quả đáng tin** dưới quy ước đã sửa đúng. Việc chạy lại
+`eval_full_test.py` (chỉ eval, không train lại) đang chạy ở mục trên vì vậy
+**không còn cần thiết nữa** — đã dừng — vì checkpoint đó vẫn học theo quy ước
+payee, eval với graph payer-convention (dù đã đúng chuẩn) vẫn cho kết quả
+KHÔNG Ý NGHĨA (model chưa từng thấy payer-relationship lúc train).
+
+**Trạng thái hiện tại — DỪNG lại chờ xác nhận (theo đúng yêu cầu "chỉ sau khi
+kiểm chứng thành công mới tiến hành các bước sửa tiếp theo")**: code đã sửa
+đúng + verify PASS. CHƯA train lại bất kỳ checkpoint nào. Toàn bộ kết luận
+"fusion thua GBM 8×, signal-limited" từ các mục trước đó trong file này giờ
+**không còn cơ sở đáng tin** (dựa trên checkpoint train sai quy ước) — cần
+train lại ít nhất 1 biến thể (khuyến nghị: GraphMAE pretrain trước — rẻ, không
+cần nhãn — rồi warm-start E2 v3 kiểu cũ, hoặc train thẳng E2 v2 lại từ đầu) để
+có con số đáng tin dưới quy ước đã sửa, trước khi quyết định bước tiếp theo.
+
+## Graph-only baseline train lại SAU KHI sửa Direction — xác nhận bug có tác động thật (2026-09-06)
+
+Theo yêu cầu: train lại `train_graph_only_hypothesis.py` (GraphSAGE tự học, KHÔNG
+BERT/fusion/GraphMAE) từ đầu dưới quy ước hướng cạnh đã sửa, để biết trần năng
+lực thật của riêng nhánh graph trước khi đưa BERT/fusion vào lại. Bổ sung
+`p_at_1000`/`recall_at_1000` vào `train_eval/metrics.py::compute_metrics`
+(tham số `k_list`, mặc định `None` — không đổi hành vi các nơi gọi cũ).
+
+**Kết quả sơ bộ (LR mặc định 1e-3, hidden=out=128, Linear, 30 epoch, 54.9 giây,
+CHƯA sweep)** — so với thí nghiệm gốc (hướng cạnh SAI, trước fix):
+
+| | pure_test AUPRC | pure_test F1 | ROC-AUC |
+|---|---|---|---|
+| Trước fix (hướng cạnh sai, mục "Thí nghiệm tối giản") | 0.013–0.020 | 0.01–0.06 | ~0.5–0.6 |
+| **Sau fix (LR mặc định, chưa tune)** | **0.099** | 0.075 | **0.979** |
+
+**Tăng ~5–7 lần chỉ với việc sửa đúng hướng cạnh, LR còn chưa tune** — xác nhận
+mạnh mẽ bug hướng cạnh là nguyên nhân thật, đáng kể, không chỉ là chi tiết kỹ
+thuật. Đang chạy sweep đầy đủ để tìm LR/cấu hình tốt nhất dưới quy ước đã sửa
+(theo yêu cầu "sửa Direction + LR" — không giả định LR cũ 1e-3 vẫn tối ưu vì
+hướng aggregate đã đổi hoàn toàn từ payee sang payer).
+
+**Sweep v2** (`train_eval/sweep_graph_only_v2.py`): mở rộng lưới so với sweep
+gốc (12 config, đã lỗi thời do bug hướng cạnh) — `learning_rate`×{3e-4, 1e-3,
+3e-3, 1e-2} × `(hidden,out)`×{(64,64),(128,128),(256,128)} × `mlp_classifier`
+×{có,không} = **24 config**, cùng kỷ luật chọn theo val AUPRC (không nhìn
+pure_test lúc chọn). Kết quả lưu
+`output/graph_only_sweep_v2_fixed_direction_results.json` (giữ nguyên
+`output/graph_only_sweep_results.json` cũ để đối chiếu, không ghi đè).
+
+### KẾT QUẢ SWEEP V2 — ĐẢO NGƯỢC HOÀN TOÀN KẾT LUẬN TRƯỚC (đã chạy xong, 2026-09-06)
+
+**Cấu hình tốt nhất theo val AUPRC**: `lr=0.003, hidden=64, out=64,
+mlp_classifier=True` (dừng ở epoch 144/150, 125.5 giây train, val AUPRC=0.3118).
+
+**GraphSAGE THUẦN (không BERT/fusion/GraphMAE) trên `pure_test`** (609,773
+account thật, 312 dương, bài test inductive nghiêm ngặt nhất — 0% cạnh
+train-time):
+
+| Metric | Giá trị |
+|---|---|
+| AUPRC | **0.3025** |
+| ROC-AUC | **0.9836** |
+| F1(pos) @ threshold 0.5 | 0.0861 |
+| Precision @ 0.5 | 0.0453 |
+| Recall @ 0.5 | 0.8846 |
+| P@1000 | **0.193** |
+| Recall@1000 | **0.619** |
+
+(val: AUPRC=0.312, ROC-AUC=0.995, Recall@1000=0.821 | overlap: AUPRC=0.170,
+ROC-AUC=0.973, Recall@1000=0.608 — đầy đủ 3 split trong
+`output/graph_only_sweep_v2_fixed_direction_results.json`)
+
+**So với thí nghiệm gốc (hướng cạnh sai)**: AUPRC 0.013–0.020 → **0.303**,
+tăng **~15–23 lần**. Xu hướng learning_rate rõ trong sweep: LR quá nhỏ (3e-4)
+hoặc quá lớn (1e-2) đều kém hẳn — 3e-3 là điểm rơi tốt nhất (khác hẳn LR=1e-3
+từng "tốt nhất" ở sweep gốc bị bug — xác nhận đúng lo ngại "không thể giả định
+LR cũ còn tối ưu khi hướng aggregate đổi hoàn toàn").
+
+**So sánh trực tiếp với GBM (baseline tốt nhất trước đó)**:
+
+| Metric | GraphSAGE thuần (đã sửa hướng) | GBM (đã tune) |
+|---|---|---|
+| AUPRC | 0.303 | **0.347** |
+| ROC-AUC | **0.984** | 0.959 |
+| P@1000 | **0.193** | 0.186 |
+| Recall@1000 | **0.619** | 0.596 |
+
+**GraphSAGE thuần giờ NGANG NGỬA hoặc VƯỢT GBM** trên ROC-AUC/P@1000/Recall@1000,
+chỉ thua nhẹ về AUPRC (0.303 vs 0.347, khoảng cách ~13%, không còn là 8× như
+trước).
+
+**Kết luận phải đảo ngược hoàn toàn**: mục "Tổng kết chuỗi chẩn đoán E2 v2 →
+GBM" và mọi mục liên quan ở TRÊN (kết luận "signal-limited, kiến trúc graph
+kém hơn hẳn tabular") **dựa trên checkpoint bị bug hướng cạnh — KHÔNG còn
+đúng**. Bug hướng cạnh (aggregate từ payee thay vì payer) đã che giấu tín hiệu
+graph THẬT SỰ MẠNH suốt toàn bộ investigate trước đó — không phải "kiến trúc
+GraphSAGE+BERT tối ưu hoá kém hơn boosted trees trên đặc trưng có sẵn" như kết
+luận cũ, mà đơn giản là graph encoder đã học sai chiều thông tin từ đầu.
+
+**Việc cần làm tiếp**: với tín hiệu graph THUẦN đã mạnh gần bằng GBM, BERT/fusion
+(giờ cũng cần train lại dưới quy ước đã sửa) có cơ hội thật sự vượt qua GBM —
+khác hẳn nhận định "không đáng đầu tư" trước đó. Ưu tiên: (1) train lại E2 v2
+(BERT+GraphSAGE) từ đầu dưới quy ước đã sửa, (2) train lại GraphMAE pretrain
+rồi warm-start E2 v3, (3) so sánh cả hai với GBM và với GraphSAGE-thuần-đã-sửa
+(0.303) làm mốc tham chiếu mới — TOÀN BỘ cần chạy lại, không checkpoint nào từ
+trước 2026-09-06 còn dùng được trực tiếp.
+
+## Đề xuất split mới cho MulDiGraph — `Dataset/temporal_pyg.py` (2026-09-07)
+
+Theo yêu cầu: đọc lại cách split CŨ (`tổng_hợp_markdown/preprocessing_and_eval_report.md`)
+rồi đổi sang cách split MỚI trong `Dataset/temporal_pyg.py` — đã implement
+`load_raw_data()` (trước đó chỉ là khung `NotImplementedError`) với dữ liệu
+THẬT, dùng ĐÚNG index space với `address_to_index.pkl`/`node_features_all23.pt`
+của pipeline `inductive_model` hiện có (để 2 cách split đối chiếu trực tiếp
+được). Đã chạy thật, không phải mô phỏng.
+
+**Split CŨ (đang dùng cho toàn bộ `data/preprocessed/Dataset_MG/`)**: **1 mốc
+cắt toàn cục** `T_cutoff` = phân vị 80% trên TOÀN BỘ 13,551,303 timestamp giao
+dịch (không riêng phishing) = 2018-06-03. Phân loại theo `t_first`/`t_last` mỗi
+account so với mốc này → train/val/overlap/pure_test = **519/117/217/312**
+(44.5%/10.0%/18.6%/26.8% của 1,165 phisher) — tỉ lệ này là HỆ QUẢ của phân bố
+thời gian, không phải thiết kế chủ đích.
+
+**Split MỚI (`temporal_pyg.py`)**: **2 mốc cắt theo QUANTILE trên chính t_first
+của 1,165 phisher** (q=0.65, q=0.80) — do STATUS.md/artifact histogram trước đó
+đã phát hiện phân bố phisher lệch cực mạnh (67.5% rơi vào H1/2018, đỉnh T5/2018)
+nên cắt theo % lịch thông thường sẽ làm méo tỉ lệ dương giữa các split. Đồ thị
+theo kiểu **"growing graph" tích lũy** (val chứa toàn bộ train + phần mới; test
+chứa toàn bộ trước đó + mới nhất) — 3 subgraph RIÊNG BIỆT, không phải 1 đồ thị
+dùng chung như split cũ. Nhãn chỉ gán cho node MỚI xuất hiện đúng cửa sổ của
+split đó; âm lấy mẫu (tỉ lệ 1:10) cũng CHỈ trong đúng cửa sổ thời gian đó
+(tránh âm từ tương lai/quá khứ xa).
+
+**Kết quả chạy thật** (`python3 Dataset/temporal_pyg.py`, 19.2 giây cho
+`load_raw_data()`, tổng cộng dưới 30 giây):
+
+| Split | Mốc cắt | Dương mới | Âm mới (1:10) | Node subgraph (tích lũy) | Cạnh (tích lũy) |
+|---|---|---|---|---|---|
+| train | ≤ 2018-05-18 11:57 UTC | 757 (**65.0%**) | 7,570 | 2,217,282 | 10,238,978 |
+| val | → 2018-06-18 23:35 UTC | 175 (**15.0%**) | 1,750 | 2,485,634 | 11,413,288 |
+| test | → hết dữ liệu | 233 (**20.0%**) | 2,330 | 2,973,489 (toàn bộ) | 13,551,296* |
+
+(*13,551,296 vs tổng thật 13,551,303 cạnh — lệch 7 cạnh, có thể do vài cạnh có
+timestamp nhỉnh hơn `max(node_first_time)` một chút; chưa điều tra sâu, sai số
+0.00005%, không đáng kể.)
+
+Tổng dương = 757+175+233 = **1,165** ✓ (không mất account nào), đúng CHÍNH XÁC
+tỉ lệ 65/15/20 thiết kế — khác hẳn split cũ vốn không nhắm tỉ lệ cụ thể nào.
+
+**Khác biệt cốt lõi so với split cũ, cần cân nhắc trước khi thay thế**:
+1. Split cũ dùng **1 đồ thị suy luận chung** (`adj_inference.npz`) cho mọi split,
+   chỉ khác nhãn/partition gán trên cùng tập node — kiến trúc `inductive_model`
+   hiện tại (`LabelAwareNeighborSampler`, `full_graph_forward`...) được thiết kế
+   xung quanh giả định NÀY. Split mới dùng **3 đồ thị con tích lũy KHÁC NHAU**
+   (số node/cạnh khác nhau ở mỗi split) — cần viết lại đáng kể phần data-loading
+   của `inductive_model` (không chỉ đổi file `labels.pkl`/`partition.pkl`) nếu
+   muốn áp dụng đầy đủ tinh thần "growing graph" thay vì chỉ lấy lại ngưỡng cắt.
+2. Âm lấy mẫu THEO CỬA SỔ THỜI GIAN (mới) khác hẳn lấy mẫu TOÀN BỘ partition
+   (cũ) — ảnh hưởng trực tiếp đến những gì `train_e2*.py`/`train_graph_only_hypothesis.py`
+   coi là "âm train" (hiện đang dùng toàn bộ ~1.9M âm của partition `train` cũ).
+3. Đây là **artifact riêng, độc lập**, CHƯA ghi đè `data/preprocessed/Dataset_MG/`
+   — mọi pipeline/checkpoint hiện có (kể cả GraphSAGE thuần vừa sửa hướng cạnh,
+   AUPRC=0.303) vẫn dùng split cũ, không bị ảnh hưởng bởi thay đổi này.
+
+**Việc cần làm tiếp (chưa làm, chờ xác nhận hướng)**: quyết định xem có muốn
+(a) chỉ lấy 2 mốc cắt quantile mới áp vào ĐÚNG kiến trúc dữ liệu cũ (1 đồ thị
+suy luận chung, chỉ đổi ngưỡng phân loại) — thay đổi nhỏ, tương thích ngược, hay
+(b) chuyển hẳn sang kiến trúc "growing graph" 3-subgraph của `temporal_pyg.py`
+— thay đổi lớn, cần viết lại data-loading, nhưng đúng tinh thần thiết kế gốc
+của file này hơn. Chưa train lại gì với split mới này.
+
+### Đã chọn (a): áp 2 mốc cắt quantile vào kiến trúc dữ liệu CŨ — hoàn tất, verify PASS (2026-09-07)
+
+Viết `Dataset/mg_temporal_pipeline_v2_quantile.py` — **giữ nguyên logic phân
+loại của `mg_temporal_pipeline.py` gốc** (train/val/overlap/pure_test theo
+`(t_first, t_last)` của từng account so với 2 mốc cắt, 1 đồ thị suy luận
+chung `adj_inference.npz`) — **chỉ thay cách tính mốc cắt**:
+
+| | Bản gốc | Bản v2 (mới) |
+|---|---|---|
+| Mốc `T_cutoff` (biên pure_train_candidates/overlap/pure_test) | percentile 80% trên TOÀN BỘ 13,551,303 giao dịch | = **t2** = quantile 0.80 trên t_first của 1,165 phisher = **2018-06-18** |
+| Mốc train/val | "latest 10% của pure_train_candidates theo t_last" | = **t1** = quantile 0.65 trên t_first của 1,165 phisher = **2018-05-18** |
+
+Tái sử dụng `labels.pkl`/`t_first.pkl`/`t_last.pkl`/`address_to_index.pkl` đã
+có sẵn (không đọc lại `MulDiGraph.pkl` cho bước này) + build lại
+`adj_train.npz` với `T_cutoff=t2` mới (51.5 giây) — `adj_inference.npz` không
+đổi (toàn bộ giao dịch, không phụ thuộc T_cutoff) nên copy thẳng từ bản gốc.
+
+**Kết quả thật, đầy đủ 7 kiểm định PASS** (`data/preprocessed/Dataset_MG_v2_quantile/`):
+
+| Split | Bản gốc (n, %/1165) | Bản v2 (n, %/1165) |
+|---|---|---|
+| train | 519 (44.5%) | **558 (47.9%)** |
+| val | 117 (10.0%) | **180 (15.5%)** |
+| overlap | 217 (18.6%) | **194 (16.7%)** |
+| pure_test | 312 (26.8%) | **233 (20.0%)** — khớp CHÍNH XÁC mục tiêu thiết kế 20% |
+| `adj_train.npz` nnz | 4,162,599 | **4,430,051** (T_cutoff muộn hơn 15 ngày) |
+
+**Verify invariant nghiêm ngặt nhất** (đã làm lại đúng kỷ luật xuyên suốt dự
+án): `pure_test` (487,855 account) có bậc = 0 TUYỆT ĐỐI trong `adj_train.npz`
+mới — **PASS 487,855/487,855**. 7/7 kiểm định khác (boundary consistency,
+disjoint, phishing coverage, phân bố không bị cân bằng nhân tạo...) đều PASS,
+xem `data/preprocessed/Dataset_MG_v2_quantile/split_config.json`/`split_stats.json`.
+
+**Lưu ý về khác biệt val/overlap so với thiết kế 3-way của `temporal_pyg.py`**:
+vì giữ logic `(t_first, t_last)` đầy đủ của kiến trúc cũ (rigorous hơn thiết
+kế đơn giản chỉ dùng `t_first` của `temporal_pyg.py`), val/overlap ở đây
+KHÔNG khớp tỉ lệ 15%/0% mà `temporal_pyg.py` báo cáo riêng lẻ — một phần
+account "sinh ra" trong cửa sổ [t1,t2) nhưng còn hoạt động QUA t2 bị xếp vào
+`overlap` (194) thay vì `val`, đúng tinh thần chống leakage nghiêm ngặt hơn
+của kiến trúc cũ. Chỉ số quan trọng nhất — `pure_test` = 20.0% — khớp tuyệt
+đối với mục tiêu.
+
+**Trạng thái**: artifact ĐỘC LẬP tại `data/preprocessed/Dataset_MG_v2_quantile/`,
+**CHƯA thay thế** `data/preprocessed/Dataset_MG/` gốc — mọi checkpoint/kết quả
+hiện có (GraphSAGE thuần đã sửa hướng cạnh AUPRC=0.303, GBM baselines...) vẫn
+dùng split gốc, không bị ảnh hưởng. Muốn dùng split v2 để train, các script
+`train_e2*.py`/`train_graph_only_hypothesis.py`/`data_prep/labels_io.py` cần
+trỏ `PREPROC_DIR` sang thư mục mới này (chưa làm — chờ xác nhận có muốn
+chính thức chuyển sang split này hay chỉ dùng để đối chiếu).
+
+### SỬA LẠI (theo yêu cầu): bỏ hẳn "overlap" — 3-way split thuần theo t_first, đúng `temporal_pyg.py` (2026-09-07)
+
+v2 ở trên (giữ `(t_first, t_last)` straddle-check của kiến trúc cũ) vẫn còn
+category `overlap` — **không đúng ý muốn**: chỉ cần 3 nhóm train/val/test,
+phân loại THUẦN theo `t_first` (bỏ hẳn kiểm tra `t_last`), khớp CHÍNH XÁC logic
+`build_splits()` trong `Dataset/temporal_pyg.py`. Viết
+`Dataset/mg_temporal_pipeline_v3_no_overlap.py` (thay thế v2, giữ file v2 lại
+để đối chiếu lịch sử, không xoá).
+
+**Quy tắc**: `train`: `t_first < t1` | `val`: `t1 <= t_first < t2` | `test`:
+`t_first >= t2` (t1/t2 giống hệt v2: quantile 0.65/0.80 trên t_first của 1,165
+phisher = 2018-05-18 / 2018-06-18). **`adj_train.npz` build lại với
+`T_cutoff = t1`** (khác v2 dùng t2) — khớp đúng định nghĩa "train window" của
+`temporal_pyg.py` (train chỉ thấy cạnh đến t1, không đến t2).
+
+**Kết quả thật, 8/8 kiểm định PASS** (`data/preprocessed/Dataset_MG_v3_no_overlap/`):
+
+| Split | n account | Dương | %/1,165 |
+|---|---|---|---|
+| train | 2,217,282 | 757 | **65.0%** |
+| val | 268,352 | 175 | **15.0%** |
+| test | 487,855 | 233 | **20.0%** |
+
+Khớp **CHÍNH XÁC** tỉ lệ thiết kế 65/15/20 (không còn lệch do overlap như v2).
+`adj_train.npz` (v3): nnz=3,859,882 (T_cutoff=t1, sớm hơn t2 nên ít cạnh hơn
+v2's 4,430,051). **Invariant nghiêm ngặt nhất verify lại PASS**: `test`
+(487,855 account) có bậc = 0 TUYỆT ĐỐI trong `adj_train.npz` mới — 0/487,855.
+Các boundary/disjoint/coverage/phân-bố-không-nhân-tạo khác đều PASS.
+
+**Lưu ý khác biệt cần nhớ khi dùng split này**: `val` (268,352 account, 175
+dương) giờ **cũng có bậc = 0 trong adj_train** giống `test` (vì `t_first>=t1`
+đồng nghĩa chưa có cạnh nào trước t1) — tức **val giờ mang tính "inductive"
+giống test**, không còn là "in-distribution, đã thấy 1 phần cấu trúc" như
+`val` của kiến trúc cũ. Đây là hệ quả trực tiếp, có chủ đích, của việc bỏ
+`t_last`/overlap — cần nhớ khi diễn giải kết quả val lúc train (val giờ đóng
+vai trò "test sớm hơn", không phải "validation nhẹ nhàng" nữa).
+
+**Trạng thái**: artifact tại `data/preprocessed/Dataset_MG_v3_no_overlap/`,
+**thay thế v2 làm phiên bản split-mới chính thức** (v2 giữ lại chỉ để đối
+chiếu lịch sử) — vẫn **CHƯA thay thế** `data/preprocessed/Dataset_MG/` gốc,
+chưa train lại gì với split này. Muốn dùng cần trỏ `PREPROC_DIR` trong
+`data_prep/labels_io.py` sang thư mục v3 này, và các nơi có check cứng
+`partition=='overlap'`/`partition=='pure_test'` (vd `eval_full_test.py`,
+`train_graph_only_hypothesis.py`) cần đổi tên thành `'test'` cho khớp.
+
+### Đã wire split v3 vào `train_graph_only_hypothesis.py` — KHÔNG đổi `PREPROC_DIR` toàn cục (2026-09-07)
+
+**Quyết định quan trọng, khác với đề xuất ban đầu**: KHÔNG sửa
+`data_prep/labels_io.py::PREPROC_DIR` trực tiếp — vì hằng số này được import
+TOÀN CỤC bởi mọi script fusion (`train_e2*.py`, `pretrain_graph_encoder.py`,
+mọi `smoke_test_*.py`). Đổi thẳng sẽ khiến nhánh **graph** của các script đó
+âm thầm chuyển sang split v3 trong khi nhánh **text** (`e2_train_corpus.py`,
+`full_test_corpus.py`) vẫn dùng corpus BERT đã build sẵn cho split CŨ — 2
+nhánh học 2 tập account khác nhau mà không có cảnh báo gì, một lỗi ngầm mới.
+Việc phát hiện ra rủi ro này khi triển khai, không phải đoán trước.
+
+**Giải pháp an toàn**: thêm tham số `--split-dir` **CHỈ RIÊNG**
+`train_eval/train_graph_only_hypothesis.py` (mặc định `None` = hành vi CŨ,
+100% tương thích ngược — đã smoke-test xác nhận không đổi) — vì nhánh
+graph-only KHÔNG phụ thuộc corpus BERT nào, tự nó luôn nhất quán bất kể trỏ
+tới split nào. Thêm `_load_labels_partition_from_dir()` (đọc trực tiếp
+`labels.pkl`/`partition.pkl`/`address_to_index.pkl` từ 1 thư mục bất kỳ) và
+tổng quát hoá `build_partition_indices()`/`evaluate()`/`naive_baselines()` để
+**tự phát hiện tên các nhóm eval** từ chính `partition.pkl` (không hard-code
+`"overlap"`/`"pure_test"` nữa) — dùng được với CẢ split cũ (4 nhóm) lẫn v3 (3
+nhóm, không overlap) bằng cùng 1 file code.
+
+**Đã smoke-test cả 2 chế độ, đều chạy đúng**:
+- Mặc định (không `--split-dir`): vẫn ra đúng `val`/`overlap`/`pure_test` như
+  trước — xác nhận không phá vỡ hành vi cũ.
+- `--split-dir .../Dataset_MG_v3_no_overlap`: ra đúng `val`/`test` (không còn
+  `overlap`), `test` n=487,855 — khớp đúng số liệu đã build.
+
+**`eval_full_test.py` — KHÔNG đổi, cần nói rõ lý do (tránh hiểu lầm)**: khác
+`train_graph_only_hypothesis.py`, script này KHÔNG đọc `partition.pkl` trực
+tiếp — nó đọc từ `data_prep/full_test_corpus.py`, vốn nạp 1 corpus BERT ĐÃ
+TOKENIZE SẴN (`runs/expanded_test_attempt3/full_test_corpus/`) được build một
+lần cho ĐÚNG tập 811,704 account của split CŨ (609,773 pure_test + 201,931
+overlap), với nhãn `.split` gán CỨNG lúc build corpus đó, không lấy từ
+`partition.pkl` hiện tại. **Nếu chỉ đổi tên chuỗi filter `'pure_test'`/`'overlap'`
+thành `'test'` mà không build lại corpus, script sẽ chạy nhưng tìm thấy 0 mẫu
+khớp `split=='test'` — lỗi câm, không phải cảnh báo rõ ràng** — vì vậy đã
+CHỦ ĐỘNG KHÔNG sửa file này. Muốn `eval_full_test.py` dùng được split v3 cần
+**build lại corpus BERT cho đúng 487,855 account `test` mới** (dựng câu giao
+dịch + tokenize — việc tốn thời gian hơn nhiều, tương tự quy mô đã làm cho
+`runs/expanded_test_attempt3/full_test_corpus/` ban đầu) — đây là việc RIÊNG,
+lớn hơn, chưa làm, cần xác nhận trước khi bắt tay vào.
+
 ## Giai đoạn F — Quyết định scale
-- [ ] F1, F2, F3 — KHÔNG scale kiến trúc fusion hiện tại; xem "Tổng kết" ở trên cho hướng đi tiếp theo (ưu tiên sửa kiến trúc trước, mở rộng nhãn dương song song)
+
+## Giai đoạn F — Quyết định scale
+- [ ] F1, F2, F3 — TẠM DỪNG, chờ train lại E2 v2/GraphMAE dưới quy ước hướng cạnh đã sửa trước khi quyết định (xem mục "KẾT QUẢ SWEEP V2" ở trên — kết luận "không scale fusion" trước đó không còn cơ sở)
 
 ## Giai đoạn G — Dọn dẹp & tài liệu
 - [ ] G1, G2, G3 — có thể làm song song

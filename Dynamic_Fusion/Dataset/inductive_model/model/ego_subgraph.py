@@ -40,8 +40,12 @@ def build_ego_subgraph(
     predict_account.py để tính cờ độ tin cậy (bao nhiêu node trong subgraph
     không có lịch sử train-time)."""
     rng = np.random.default_rng(seed)
+    # Transpose de _neighbors() lay dung PAYER (nguoi da gui tien cho seed_node),
+    # khop quy uoc "incoming" cua full_graph_forward/graph_train.pt -- xem
+    # data/graph_data.meta.json field 'edge_direction_convention' va
+    # model/label_aware_sampler.py cho ly do day du.
     global_ids, edge_index, edge_weight, seed_local_idx = sample_union_subgraph(
-        adj_inference_csr, [seed_node], len(fanout), _uniform_budget_fn(fanout), rng
+        adj_inference_csr.T.tocsr(), [seed_node], len(fanout), _uniform_budget_fn(fanout), rng
     )
     data = subgraph_to_data(global_ids, edge_index, edge_weight, node_features)
     return data, int(seed_local_idx.item()), global_ids

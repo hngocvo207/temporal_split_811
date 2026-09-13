@@ -87,9 +87,12 @@ def main():
     sampler = LabelAwareNeighborSampler(adj_train, labels_tensor, seed=GLOBAL_SEED)
 
     graph_encoder, classifier = build_models(device)
-    optimizer = torch.optim.AdamW(
-        list(graph_encoder.parameters()) + list(classifier.parameters()), lr=args.lr
-    )
+    optimizer = torch.optim.AdamW([
+    {"params": classifier.text_encoder.parameters(), "lr": 2e-5},
+    {"params": graph_encoder.parameters(), "lr": 1e-3},
+    {"params": classifier.fusion.parameters(), "lr": 1e-3},
+    {"params": classifier.classifier.parameters(), "lr": 1e-3},
+])
 
     train_loader = make_train_loader(train_examples, args.batch_size, pos_neg_ratio=args.pos_neg_ratio)
 

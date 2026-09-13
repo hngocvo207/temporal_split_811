@@ -39,7 +39,16 @@ class LabelAwareNeighborSampler:
         seed: int = 44,
     ):
         assert len(budgets_pos) == len(budgets_neg)
-        self.adj_csr = adj_csr
+        # QUY UOC HUONG CANH (sua bug 2026-09-06, xem data/graph_data.meta.json
+        # field 'edge_direction_convention'): _neighbors() trong graph_sampling.py
+        # luon doc HANG cua center trong CSR (adj_csr.indptr[center]:...+1]).
+        # Doi ten bien edge_src/edge_dst trong sample_union_subgraph KHONG du de
+        # doi ngu nghia -- van la HANG cua center (payee/out-neighbor), du gan
+        # vao vai tro nao. De center thuc su aggregate tu PAYER (nguoi da gui
+        # tien CHO center, dung quy uoc "incoming" cua full_graph_forward/
+        # graph_train.pt) thi phai TRANSPOSE ma tran truoc: hang cua center
+        # trong adj_csr.T = cot cua center trong adj_csr goc = payer that.
+        self.adj_csr = adj_csr.T.tocsr()
         self.labels = labels
         self.budgets_pos = tuple(budgets_pos)
         self.budgets_neg = tuple(budgets_neg)

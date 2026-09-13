@@ -142,7 +142,11 @@ def main():
 
     print("loading full node features + adj_train (toan bo graph_train.pt, khong loc nhan/partition)...")
     node_features = load_node_features()
-    adj_train = sp.load_npz(PREPROC_DIR / "adj_train.npz")
+    # Transpose -- de _neighbors() trong sample_union_subgraph lay dung PAYER
+    # (nguoi da gui tien cho center), khop quy uoc "incoming" cua
+    # full_graph_forward/graph_train.pt -- xem data/graph_data.meta.json field
+    # 'edge_direction_convention' va model/label_aware_sampler.py.
+    adj_train = sp.load_npz(PREPROC_DIR / "adj_train.npz").T.tocsr()
     num_nodes = node_features.shape[0]
     print(f"num_nodes={num_nodes} in_channels={node_features.shape[1]}")
 

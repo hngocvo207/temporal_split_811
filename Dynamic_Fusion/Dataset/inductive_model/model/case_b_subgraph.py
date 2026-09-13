@@ -103,8 +103,10 @@ def build_case_b_subgraph(
             seeds_for_expansion = [seeds_for_expansion[i] for i in idx]
             counterparty_weights = [counterparty_weights[i] for i in idx]
             counterparty_global_ids = seeds_for_expansion
+        # Transpose -- cung ly do nhu ego_subgraph.py (khop quy uoc "incoming",
+        # xem data/graph_data.meta.json field 'edge_direction_convention').
         global_ids, edge_index, edge_weight, _ = sample_union_subgraph(
-            adj_inference_csr, seeds_for_expansion, len(remaining_fanout),
+            adj_inference_csr.T.tocsr(), seeds_for_expansion, len(remaining_fanout),
             uniform_budget_fn(remaining_fanout), rng,
         )
 
