@@ -7,7 +7,19 @@ xem data_prep/full_test_corpus.py).
 
 Không train -- chỉ load checkpoint + eval. Log lên wandb (project
 fraud_detection_inductive, group "e2_full_eval").
-"""
+
+So sánh với GBM (theo yêu cầu): thêm P@100/P@1000/Recall@1000 (k_list, giống
+hệt metric GBM đã báo cáo) và in bảng đối chiếu trực tiếp với con số GBM đã
+TUNE (output/gbm_hparam_sweep_result.json, chạy trên ĐÚNG cùng pure_test đầy
+đủ 609,773 account của split cũ -- chỉ so sánh công bằng khi checkpoint E2
+cũng train/eval trên split cũ, xem STATUS.md).
+
+Theo yêu cầu bổ sung (so sánh F1-positive ở ngưỡng mặc định VÀ ngưỡng tối ưu):
+eval CẢ HAI threshold=0.5 (mặc định) và threshold=checkpoint['threshold']
+(tối ưu, đã quét trên val lúc train -- xem train_e2_v2.py) cho mỗi split, và
+đọc GBM_TUNED_REFERENCE trực tiếp từ output/gbm_hparam_sweep_result.json (đã
+tự lưu cả 2 ngưỡng từ gbm_baseline.py) thay vì hardcode, để luôn khớp lần
+chạy GBM gần nhất."""
 import argparse
 import json
 import time
@@ -17,10 +29,27 @@ import torch
 import wandb
 
 from data_prep.full_test_corpus import load_full_test_examples
-from train_eval.train_e2 import build_models, evaluate
+from train_eval.metrics import compute_metrics
+from train_eval.train_e2 import build_models, compute_probs_labels
 
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "output"
 WANDB_PROJECT = "fraud_detection_inductive"
+
+
+def _load_gbm_reference():
+    """Doc output/gbm_hparam_sweep_result.json (ghi boi gbm_baseline.py) thay
+    vi hardcode -- luon khop lan chay GBM gan nhat, ca 2 threshold (mac
+    dinh/toi uu). None neu file chua ton tai (chua chay gbm_baseline.py)."""
+    p = OUTPUT_DIR / "gbm_hparam_sweep_result.json"
+    if not p.exists():
+        return None
+    with open(p) as f:
+        d = json.load(f)
+    return {
+        "default_t": d["final_full_test_metrics"],
+        "best_t": d.get("final_full_test_metrics_best_threshold"),
+        "best_threshold": d.get("best_threshold"),
+    }
 
 
 def main():
@@ -65,17 +94,62 @@ def main():
         n_split = sum(1 for e in examples if e.split == split)
         print(f"\nevaluating {split} ({n_split} account thật -- không phải mẫu con)...")
         t0 = time.time()
-        metrics = evaluate(graph_encoder, classifier, examples, device, split_filter=split,
-                            batch_size=args.batch_size, threshold=threshold)
+        # 1 lan forward DUY NHAT (full_graph_forward + BERT tren toan bo
+        # split -- phan ton thoi gian nhat, ~54-60 acc/s) roi tinh metric o
+        # CA HAI threshold tu CUNG probs -- tranh forward 2 lan (se gap doi
+        # ~3-4h eval that neu goi evaluate() rieng cho tung threshold).
+        probs, y_true = compute_probs_labels(graph_encoder, classifier, examples, device,
+                                              split_filter=split, batch_size=args.batch_size)
+        metrics_best_t = compute_metrics(y_true, probs, threshold=threshold, k_list=[100, 1000])
+        metrics_default_t = compute_metrics(y_true, probs, threshold=0.5, k_list=[100, 1000]) \
+            if threshold != 0.5 else metrics_best_t
         dt = time.time() - t0
-        print(f"[{split}] {metrics} ({dt:.1f}s, {metrics['n']/dt:.1f} account/s)")
-        results[split] = {**metrics, "time_s": dt}
+        print(f"[{split}] @best_t={threshold:.4f}: f1={metrics_best_t['f1_pos']:.4f} "
+              f"auprc={metrics_best_t['auprc']:.4f} | @default_t=0.5: f1={metrics_default_t['f1_pos']:.4f} "
+              f"({dt:.1f}s, {metrics_best_t['n']/dt:.1f} account/s)")
+        results[split] = {**metrics_best_t, "time_s": dt,
+                           "metrics_at_default_threshold": metrics_default_t,
+                           "metrics_at_best_threshold": metrics_best_t}
         if run is not None:
-            run.log({f"{split}/{k}": v for k, v in metrics.items() if k != "threshold"})
+            run.log({f"{split}/{k}": v for k, v in metrics_best_t.items() if k != "threshold"})
+            run.log({f"{split}/default_t/{k}": v for k, v in metrics_default_t.items() if k != "threshold"})
 
-    print(f"\n=== FULL-SCALE EVAL RESULT (609,773 pure_test + 201,931 overlap thật, threshold={threshold:.4f}) ===")
+    print(f"\n=== FULL-SCALE EVAL RESULT (609,773 pure_test + 201,931 overlap thật, threshold_toi_uu={threshold:.4f}) ===")
     print(json.dumps(results, indent=2))
     print("\nBaseline Attempt-3 gốc (10k test, calibrated): F1(pos)=87.63%, AUPRC overall=0.9155")
+
+    gbm_ref = _load_gbm_reference()
+    if "pure_test" in results and gbm_ref is not None:
+        e_best, e_default = results["pure_test"]["metrics_at_best_threshold"], results["pure_test"]["metrics_at_default_threshold"]
+        g_best = gbm_ref["best_t"] or gbm_ref["default_t"]
+        g_default = gbm_ref["default_t"]
+        print("\n=== SO SÁNH TRỰC TIẾP VỚI GBM ĐÃ TUNE (cùng full pure_test, 609,773 account, split cũ) ===")
+        print("--- threshold TỐI ƯU (quét trên val, mỗi model tự chọn threshold riêng) ---")
+        print(f"{'metric':<14} {'E2 (fusion)':>14} {'GBM (tuned)':>14} {'chênh lệch':>14}")
+        for key, label in [
+            ("auprc", "AUPRC"), ("roc_auc", "ROC-AUC"), ("f1_pos", "F1(pos)"),
+            ("precision_pos", "Precision"), ("recall_pos", "Recall"),
+            ("p_at_100", "P@100"), ("p_at_1000", "P@1000"), ("recall_at_1000", "Recall@1000"),
+        ]:
+            ev, gv = e_best.get(key), g_best.get(key)
+            if ev is None or gv is None:
+                continue
+            diff = ev - gv
+            arrow = "▲ E2 thắng" if diff > 0 else ("▼ GBM thắng" if diff < 0 else "= hoà")
+            print(f"{label:<14} {ev:>14.4f} {gv:>14.4f} {diff:>+9.4f}  {arrow}")
+        print("--- threshold MẶC ĐỊNH (0.5, cả 2 model) ---")
+        print(f"F1(pos)        {e_default['f1_pos']:>14.4f} {g_default['f1_pos']:>14.4f} "
+              f"{e_default['f1_pos'] - g_default['f1_pos']:>+9.4f}")
+        print(f"Precision      {e_default['precision_pos']:>14.4f} {g_default['precision_pos']:>14.4f} "
+              f"{e_default['precision_pos'] - g_default['precision_pos']:>+9.4f}")
+        print(f"Recall         {e_default['recall_pos']:>14.4f} {g_default['recall_pos']:>14.4f} "
+              f"{e_default['recall_pos'] - g_default['recall_pos']:>+9.4f}")
+        print("\n(GBM tuned: output/gbm_hparam_sweep_result.json -- lr=0.3/max_leaf_nodes=63/l2=1.0, "
+              "chỉ 23 đặc trưng tabular, KHÔNG graph/BERT, train+eval trên ĐÚNG split cũ để so sánh công bằng.)")
+        results["gbm_tuned_reference"] = gbm_ref
+    elif "pure_test" in results:
+        print("\n[!] output/gbm_hparam_sweep_result.json chưa tồn tại -- chạy `python -m train_eval.gbm_baseline` "
+              "trước để có bảng so sánh với GBM.")
 
     if run is not None:
         run.summary["threshold"] = threshold

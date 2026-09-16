@@ -38,15 +38,20 @@ MAX_SEQ_LEN = 400  # khớp tri_model (400 + gcn_embedding_dim(16) = 416 ở b�
 
 @dataclass
 class Example:
-    input_ids: torch.Tensor      # [MAX_SEQ_LEN], padded
-    attention_mask: torch.Tensor  # [MAX_SEQ_LEN]
+    input_ids: torch.Tensor      # [MAX_SEQ_LEN], padded -- co the None neu dung `records` (xem duoi)
+    attention_mask: torch.Tensor  # [MAX_SEQ_LEN] -- co the None cung dieu kien tren
     token_type_ids: torch.Tensor  # [MAX_SEQ_LEN], toàn 0
     label: int
     global_idx: int  # index trong address_to_index.pkl / node_features_all23.pt / graph_*.pt
     address: str
-    split: str  # 'train' | 'val' | 'overlap' | 'pure_test'
+    split: str  # 'train' | 'val' | 'overlap' | 'pure_test' | 'test'
     label_strict: int = None  # nhan xac nhan doc lap (labels.pkl goc) khi khac `label`
                                # -- xem data_prep/full_test_corpus.py; None neu khong ap dung
+    records: list = None  # BERT_debug.md Task 1-2: raw per-tx record (KHONG self-address,
+                           # KHONG anonymize) cua chinh account nay -- chi set khi Example
+                           # dung cho TRAIN duoi che do render-dong-moi-epoch (xem
+                           # data_prep/e2_train_corpus.py, train_eval/train_e2_v2.py); None
+                           # cho Example da co san input_ids (eval, hoac corpus Attempt-3 cu).
 
 
 def _load_pickle(name: str):

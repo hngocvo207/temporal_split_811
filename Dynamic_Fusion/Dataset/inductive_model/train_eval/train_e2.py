@@ -105,9 +105,19 @@ def make_train_loader(train_examples, batch_size: int, pos_neg_ratio: float = No
 
 
 def train_one_epoch(graph_encoder, classifier, loader, sampler: LabelAwareNeighborSampler,
-                     node_features: torch.Tensor, optimizer, device, max_steps=None) -> float:
+                     node_features: torch.Tensor, optimizer, device, max_steps=None,
+                     pos_weight: float = None) -> float:
+    """pos_weight (BERT_debug.md Task 4, mac dinh None = hanh vi CU khong doi):
+    them class-weighted CE ben tren WeightedRandomSampler cua make_train_loader
+    -- vd pos_weight=2.0 nghia la 1 loi sai tren mau duong bi phat nang gap 2
+    loi sai tren mau am, DOC LAP voi ty le sample cua sampler (2 co che khac
+    nhau: sampler quyet dinh TAN SUAT xuat hien trong batch, pos_weight quyet
+    dinh GRADIENT MAGNITUDE khi da xuat hien)."""
     graph_encoder.train()
     classifier.train()
+    ce_weight = None
+    if pos_weight is not None:
+        ce_weight = torch.tensor([1.0, pos_weight], device=device)
     total_loss, n_steps = 0.0, 0
     for step, (input_ids, attention_mask, labels, global_idx) in enumerate(loader):
         if max_steps is not None and step >= max_steps:
@@ -119,7 +129,7 @@ def train_one_epoch(graph_encoder, classifier, loader, sampler: LabelAwareNeighb
 
         input_ids, attention_mask, labels = input_ids.to(device), attention_mask.to(device), labels.to(device)
         logits = classifier(input_ids, h_graph, attention_mask=attention_mask)
-        loss = nn.functional.cross_entropy(logits, labels)
+        loss = nn.functional.cross_entropy(logits, labels, weight=ce_weight)
 
         optimizer.zero_grad()
         loss.backward()
@@ -173,12 +183,16 @@ def compute_probs_labels(graph_encoder, classifier, examples, device, split_filt
 
 
 def evaluate(graph_encoder, classifier, examples, device, split_filter=None, batch_size=16,
-             threshold: float = 0.5) -> dict:
+             threshold: float = 0.5, k_list=None) -> dict:
     """Eval dùng full_graph_forward trên graph_inference (đồ thị đầy đủ, đúng
     nguyên tắc B3/predict_account cho account đã có trong graph) -- tính
-    h_graph cho TOÀN BỘ node 1 lần, không sample subgraph lại như lúc train."""
+    h_graph cho TOÀN BỘ node 1 lần, không sample subgraph lại như lúc train.
+
+    k_list (vd [100, 1000]) -- thêm P@k/Recall@k vào kết quả, dùng để so sánh
+    thẳng hàng với GBM baseline (xem train_eval/eval_full_test.py) -- mặc định
+    None để KHÔNG đổi hành vi các nơi gọi evaluate() khác."""
     probs, labels = compute_probs_labels(graph_encoder, classifier, examples, device, split_filter, batch_size)
-    return compute_metrics(labels, probs, threshold=threshold)
+    return compute_metrics(labels, probs, threshold=threshold, k_list=k_list)
 
 
 def main():

@@ -45,7 +45,7 @@ from data_prep.labels_io import PREPROC_DIR, load_labels, load_partition
 from model.gnn_encoder import GraphSAGEEncoder
 from model.graph_sampling import subgraph_to_data
 from model.label_aware_sampler import LabelAwareNeighborSampler
-from train_eval.metrics import compute_metrics
+from train_eval.metrics import compute_metrics, find_best_f1_threshold
 
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "output"
 GLOBAL_SEED = 44
@@ -235,8 +235,10 @@ def _get_graph_inference():
 
 
 @torch.no_grad()
-def evaluate(model: GraphOnlyClassifier, idx: dict, labels: torch.Tensor, device: torch.device,
-             eval_splits=None) -> dict:
+def compute_probs_by_split(model: GraphOnlyClassifier, idx: dict, labels: torch.Tensor, device: torch.device,
+                            eval_splits=None) -> dict:
+    """Tach rieng phan tinh probs (dung chung cho evaluate() va cho viec quet
+    threshold F1 tren val, xem main()) -- cung mau train_e2.py::compute_probs_labels."""
     eval_splits = eval_splits if eval_splits is not None else idx.get("_eval_splits", ["val", "overlap", "pure_test"])
     model.eval()
     # full_graph_forward ở hidden lớn (vd 256) + model khác đồng thời có thể
@@ -251,15 +253,20 @@ def evaluate(model: GraphOnlyClassifier, idx: dict, labels: torch.Tensor, device
     model.to(original_device)
     probs_all = torch.softmax(logits_all, dim=-1)[:, 1].numpy()
 
-    results = {}
+    out = {}
     for split in eval_splits:
         pos = idx[f"{split}_pos"]
         neg = idx[f"{split}_neg"]
         split_idx = torch.cat([pos, neg]).numpy()
-        y_true = labels[split_idx].numpy()
-        y_prob = probs_all[split_idx]
-        results[split] = compute_metrics(y_true, y_prob, k_list=[1000])
-    return results
+        out[split] = (labels[split_idx].numpy(), probs_all[split_idx])
+    return out
+
+
+@torch.no_grad()
+def evaluate(model: GraphOnlyClassifier, idx: dict, labels: torch.Tensor, device: torch.device,
+             eval_splits=None) -> dict:
+    probs_by_split = compute_probs_by_split(model, idx, labels, device, eval_splits=eval_splits)
+    return {split: compute_metrics(y_true, y_prob, k_list=[1000]) for split, (y_true, y_prob) in probs_by_split.items()}
 
 
 @torch.no_grad()
@@ -318,10 +325,26 @@ def main():
     strict_test_name = "test" if "test" in eval_splits else "pure_test"
     print(f"\n{strict_test_name} = bài test inductive THẬT (0 cạnh train-time) -- đây là con số quyết định giả thuyết.")
 
+    # F1(pos) o threshold mac dinh (0.5, da co trong final_eval) VA threshold
+    # TOI UU (quet tren val, ap sang strict_test_name) -- cung phuong phap
+    # voi gbm_baseline.py/train_e2_v2.py de so sanh cong bang giua 3 model.
+    probs_by_split = compute_probs_by_split(model, idx, labels, device, eval_splits=eval_splits)
+    val_y, val_prob = probs_by_split["val"]
+    best_threshold = find_best_f1_threshold(val_y, val_prob)
+    test_y, test_prob = probs_by_split[strict_test_name]
+    m_test_best_t = compute_metrics(test_y, test_prob, threshold=best_threshold, k_list=[1000])
+    print(f"\n=== F1(pos) tren {strict_test_name}: threshold mac dinh (0.5) vs threshold toi uu (quet tren val) ===")
+    print(f"threshold=0.5 (mac dinh)         : f1_pos={final_eval[strict_test_name]['f1_pos']:.4f} "
+          f"precision={final_eval[strict_test_name]['precision_pos']:.4f} recall={final_eval[strict_test_name]['recall_pos']:.4f}")
+    print(f"threshold={best_threshold:.4f} (toi uu): f1_pos={m_test_best_t['f1_pos']:.4f} "
+          f"precision={m_test_best_t['precision_pos']:.4f} recall={m_test_best_t['recall_pos']:.4f}")
+
     suffix = args.output_suffix
     with open(OUTPUT_DIR / f"graph_only_hypothesis_result{suffix}.json", "w") as f:
         json.dump({"baselines": baselines, "history": history, "final_eval": final_eval,
                    "best_epoch": best_epoch, "best_val_auprc": best_val_auprc,
+                   "best_threshold": best_threshold,
+                   f"final_eval_{strict_test_name}_best_threshold": m_test_best_t,
                    "split_dir": str(split_dir or PREPROC_DIR), "args": vars(args)}, f, indent=2)
     torch.save(model.state_dict(), OUTPUT_DIR / f"graph_only_hypothesis_model{suffix}.pt")
 

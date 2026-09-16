@@ -39,6 +39,7 @@ from data_prep.e2_v3_train_corpus import DEFAULT_CORPUS_DIR, load_e2_v3_train_ex
 from data_prep.e2_val_subsample import build_fixed_val_subsample
 from data_prep.io_utils import load_node_features
 from data_prep.labels_io import PREPROC_DIR
+from data_prep.text_rendering import render_examples_inplace
 from model.label_aware_sampler import LabelAwareNeighborSampler
 from train_eval.metrics import find_best_f1_threshold, compute_metrics
 from train_eval.train_e2 import D_GRAPH, build_models, compute_probs_labels, evaluate, make_train_loader, \
@@ -97,6 +98,13 @@ def main():
     train_examples = load_e2_v3_train_examples(corpus_dir=Path(args.corpus_dir), max_examples=args.max_examples)
     n_pos = sum(e.label for e in train_examples)
     print(f"train examples={len(train_examples)} n_pos={n_pos} n_neg={len(train_examples) - n_pos}")
+    # BERT_debug.md Task 1-2 (xem STATUS.md "RA SOAT CODE"): render 1 LAN duy
+    # nhat o day (KHONG lam lai moi epoch nhu train_e2_v2.py -- E2 v3 chua
+    # nam trong pham vi task nay, van dang "can chay lai" rieng, xem
+    # STATUS.md) -- van du de khong con dia chi hex that lot vao BERT, chi
+    # chua co bien thien anonymize qua epoch (Task 2's yeu cau day du).
+    print("rendering train corpus (dedup+anonymize+tokenize, seed co dinh 'train_v3_static')...")
+    render_examples_inplace(train_examples, seed="train_v3_static")
 
     val_examples = build_fixed_val_subsample(target_n=args.val_target_n, seed=GLOBAL_SEED)
     all_examples = train_examples + val_examples

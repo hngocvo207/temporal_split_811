@@ -27,10 +27,11 @@ which is a stated caveat of this evaluation, not a bug.
 Outputs -> data/preprocessed/multi_processed_data_MG_full_test/data_Dataset_MG_full_test.*
   test_y, test_y_prob        ground-truth isp, ALL 811,704 test accounts
   test_partition              'pure_test' | 'overlap' per test account
-  doc_accounts                 address behind each shuffled_clean_docs[i]
-  shuffled_clean_docs          tokenized sentences, test accounts only
-                                (val is unchanged from the existing build --
-                                reused directly by eval_full_test.py)
+  doc_accounts                 address behind each raw_records[addr]
+  raw_records                  dict address -> list of per-tx record dicts
+                                (test accounts only, no self-address -- xem
+                                mg_build_examples.py::raw_records_for();
+                                dedup/anonymize/tokenize xay ra luc train/eval)
   address_to_index             extended vocab: old vocab (unchanged order/
                                 positions) + new test accounts appended
   old_vocab_size                int, the split point for W0_vh loading
@@ -53,17 +54,14 @@ _DATASET_DIR = str(Path(__file__).resolve().parent)
 if _DATASET_DIR not in sys.path:
     sys.path.insert(0, _DATASET_DIR)
 
-# Reuse, don't duplicate: same transaction-sequence / sentence-rendering /
-# tokenizer-worker-pool logic mg_build_examples.py already uses for the
-# bounded corpus.
+# Reuse, don't duplicate: same transaction-sequence / raw-record-building
+# logic mg_build_examples.py already uses for the bounded corpus (BERT_debug.md
+# Task 1: khong con self-address; dedup/anonymize/tokenize chuyen sang luc
+# train/eval, xem inductive_model/data_prep/text_rendering.py).
 from mg_build_examples import (
     build_account_transactions,
-    sentence_for,
-    _init_worker,
-    _tokenize_one,
+    raw_records_for,
 )
-import multiprocessing as mp
-import os
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 MG_PATH = BASE_DIR / "raw_data/MulDiGraph/MulDiGraph.pkl"
@@ -71,8 +69,6 @@ SPLIT_DIR = BASE_DIR / "data/preprocessed/Dataset_MG"
 OLD_OUT_DIR = BASE_DIR / "data/preprocessed/multi_processed_data_MG"
 NEW_OUT_DIR = BASE_DIR / "data/preprocessed/multi_processed_data_MG_full_test"
 NEW_OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-TOKENIZE_WORKERS = 16
 
 
 def sep(t):
@@ -101,10 +97,10 @@ def parse_args():
     )
     ap.add_argument(
         "--reuse_docs_from", type=str, default="",
-        help="Optional: path to an existing full-test corpus dir whose tokenized "
-             "shuffled_clean_docs/doc_accounts cover exactly the same test accounts. Tokenized "
-             "text depends only on the account's transactions, never on vocab order or labels, "
-             "so reusing it skips the graph load + tokenization (the expensive part) when only "
+        help="Optional: path to an existing full-test corpus dir whose "
+             "raw_records/doc_accounts cover exactly the same test accounts. Raw records "
+             "depend only on the account's transactions, never on vocab order or labels, "
+             "so reusing them skips the graph load (the expensive part) when only "
              "the vocab prefix or label source changed. Account sets are asserted equal.",
     )
     return ap.parse_args()
@@ -166,43 +162,28 @@ def main():
     assert all(a in address_to_index_new for a in test_addrs), "every test account must resolve to a vocab index"
 
     if args.reuse_docs_from:
-        sep("Reuse already-tokenized sentences (text depends on transactions only, not vocab/labels)")
+        sep("Reuse already-built raw records (depend on transactions only, not vocab/labels)")
         reuse_dir = Path(args.reuse_docs_from)
         with open(reuse_dir / "data_Dataset_MG_full_test.doc_accounts", "rb") as f:
             reuse_accounts = pickle.load(f)
-        with open(reuse_dir / "data_Dataset_MG_full_test.shuffled_clean_docs", "rb") as f:
-            reuse_docs = pickle.load(f)
-        assert len(reuse_accounts) == len(reuse_docs)
+        with open(reuse_dir / "data_Dataset_MG_full_test.raw_records", "rb") as f:
+            reuse_records = pickle.load(f)
         assert set(reuse_accounts) == set(test_addrs), (
             f"reuse corpus covers a different account set "
             f"({len(set(reuse_accounts))} vs {len(set(test_addrs))} accounts)"
         )
-        sentences = dict(zip(reuse_accounts, reuse_docs))
-        print(f"  Reused {len(sentences):,} tokenized account sentences from {reuse_dir}")
+        raw_records = {a: reuse_records[a] for a in test_addrs}
+        print(f"  Reused {len(raw_records):,} account raw records from {reuse_dir}")
     else:
-        sep("Build per-account transaction sequences + sentences (test accounts only)")
+        sep("Build per-account transaction sequences + raw records (test accounts only)")
         print("  (full transactional history -- transductive eval, same as mg_build_examples.py)")
         seqs = build_account_transactions(MG_load(), set(test_addrs), ts_max=None)
-        sentences = {a: sentence_for(seqs[a]) for a in test_addrs}
+        raw_records = {a: raw_records_for(seqs[a]) for a in test_addrs}
         del seqs
-
-        sep("Pre-tokenize with BERT WordPiece")
-        keys = list(sentences.keys())
-        n_workers = max(1, min(TOKENIZE_WORKERS, os.cpu_count() or 1))
-        print(f"  Tokenizing {len(keys):,} accounts with {n_workers} worker process(es) ...")
-        if n_workers == 1 or len(keys) < 2000:
-            _init_worker()
-            tokenized = [_tokenize_one(sentences[a]) for a in keys]
-        else:
-            with mp.Pool(n_workers, initializer=_init_worker) as pool:
-                tokenized = pool.map(_tokenize_one, (sentences[a] for a in keys), chunksize=512)
-        for a, t in zip(keys, tokenized):
-            sentences[a] = t
 
     test_y = np.array([labels[a] for a in test_addrs], dtype=np.int64)
     test_y_prob = np.eye(2, dtype=np.float32)[test_y]
     test_y_strict = np.array([labels_strict[a] for a in test_addrs], dtype=np.int64)
-    shuffled_clean_docs = [sentences[a] for a in test_addrs]
     doc_accounts = list(test_addrs)
 
     sep("Slice full-graph adjacency to the extended vocab's order")
@@ -227,7 +208,7 @@ def main():
     save(test_y_strict, "data_Dataset_MG_full_test.test_y_strict")
     save(test_partition, "data_Dataset_MG_full_test.test_partition")
     save(doc_accounts, "data_Dataset_MG_full_test.doc_accounts")
-    save(shuffled_clean_docs, "data_Dataset_MG_full_test.shuffled_clean_docs")
+    save(raw_records, "data_Dataset_MG_full_test.raw_records")
     save(address_to_index_new, "data_Dataset_MG_full_test.address_to_index")
     save(old_vocab_size, "data_Dataset_MG_full_test.old_vocab_size")
     save_npz(out_dir / "gcn_adj_eval.npz", gcn_adj_eval.tocsr())
@@ -252,7 +233,7 @@ def main():
         )
 
     sep("Spot-checks")
-    assert len(test_y) == len(test_addrs) == len(test_partition) == len(doc_accounts) == len(shuffled_clean_docs)
+    assert len(test_y) == len(test_addrs) == len(test_partition) == len(doc_accounts) == len(raw_records)
     assert int(test_y.sum()) == n_pos
     assert int(test_y_strict.sum()) == n_pos_strict
     print(f"  [PASS] test_y n={len(test_y):,} pos={int(test_y.sum()):,} ({args.labels_source})")

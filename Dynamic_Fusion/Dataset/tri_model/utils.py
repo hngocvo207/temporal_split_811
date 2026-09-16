@@ -32,6 +32,28 @@ def del_http_user_tokenize(tweet):
     return tweet
 
 
+def anonymize_addresses(records: list, rng) -> list:
+    """BERT_debug.md Task 2: thay dia chi vi that (field 'counterparty') bang
+    ID cuc bo (addr0, addr1, ...) TRONG PHAM VI 1 document -- ngan model BERT
+    hoc thuoc chuoi hex cu the cua bat ky dia chi nao (xem STATUS.md muc "RA
+    SOAT CODE TIM NGUYEN NHAN": ~45% token moi document la chinh dia chi vi
+    lap lai, gay memorization thay vi hoc hanh vi giao dich).
+
+    Thu tu gan ID lay theo danh sach dia chi doi tac DUY NHAT, DA XAO TRON boi
+    `rng` (khong theo thu tu xuat hien thoi gian that) -- de cung 1 dia chi
+    that co the anh xa sang addrN KHAC NHAU o nhung lan goi khac nhau (rng
+    khac nhau => epoch khac nhau, xem data_prep/text_rendering.py). Thu tu
+    CHRONOLOGICAL cua cac giao dich trong `records` duoc GIU NGUYEN -- chi ID
+    gan cho counterparty la ngau nhien, khong phai thu tu ban than cac giao
+    dich (tin hieu hanh vi "giao dich lap lai voi cung 1 doi tac" van con,
+    chi khong con la dia chi hex co dinh)."""
+    unique = list(dict.fromkeys(r["counterparty"] for r in records))
+    shuffled = unique[:]
+    rng.shuffle(shuffled)
+    local_id = {addr: f"addr{i}" for i, addr in enumerate(shuffled)}
+    return [dict(r, counterparty=local_id[r["counterparty"]]) for r in records]
+
+
 def clean_str(string):
     string = re.sub(r"[^A-Za-z0-9(),!?\'\`]", " ", string)
     string = re.sub(r"\'s", " 's", string)

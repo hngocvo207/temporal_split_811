@@ -44,8 +44,12 @@ Outputs -> data/preprocessed/multi_processed_data_MG/data_Dataset_MG.*
   valid_y, valid_y_prob            (val, real distribution, ground-truth isp)
   test_y,  test_y_prob             (pure_test + overlap; ground-truth isp;
                                      a parallel test_partition array tags which)
-  shuffled_clean_docs               train + valid + test sentences, in
-                                     that concatenation order
+  raw_records                       dict address -> list of per-tx record
+                                     dicts (counterparty/amount/in_out/
+                                     timestamp/n-gram, KHONG co self-address
+                                     -- xem raw_records_for(), BERT_debug.md
+                                     Task 1). Dedup/anonymize/tokenize xay ra
+                                     luc train/eval, khong o day nua.
   address_to_index                  GLOBAL vocab: train + overlap + val +
                                      pure_test (this run's sampled
                                      accounts), used to slice
@@ -58,8 +62,6 @@ Outputs -> data/preprocessed/multi_processed_data_MG/data_Dataset_MG.*
 from __future__ import annotations
 
 import argparse
-import multiprocessing as mp
-import os
 import pickle
 import random
 import sys
@@ -77,28 +79,14 @@ if _TRI_MODEL_DIR not in sys.path:
     sys.path.insert(0, _TRI_MODEL_DIR)
 
 from mg_graph_weight_formula import ALPHA
-from utils import clean_str
-from pytorch_pretrained_bert.tokenization import BertTokenizer
 
-MAX_TX_PER_ACCOUNT_TEXT = 30  # most recent N; example2feature truncates to
-# ~400 tokens anyway (MAX_SEQ_LENGTH - gcn_dim), and each transaction
-# renders to ~15-25 wordpieces, so 30 is already more than enough context
-# -- this only bounds the STRING-BUILDING cost for outlier hub accounts
-# with thousands of transactions, it does not change which accounts or
-# n-gram values are used (deltas are computed on the FULL chronological
-# sequence first, only the rendered TEXT is truncated to the tail).
-
-_worker_tokenizer = None
-
-
-def _init_worker():
-    global _worker_tokenizer
-    _worker_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", do_lower_case=True)
-
-
-def _tokenize_one(sentence: str) -> str:
-    sub_words = _worker_tokenizer.tokenize(clean_str(sentence))
-    return " ".join(sub_words) if sub_words else "[UNK]"
+MAX_TX_PER_ACCOUNT_TEXT = 30  # most recent N; each transaction renders to
+# ~15-25 wordpieces after tokenize (xem text_rendering.py), so 30 is already
+# more than enough context -- this only bounds the RECORD-BUILDING cost for
+# outlier hub accounts with thousands of transactions, it does not change
+# which accounts or n-gram values are used (deltas are computed on the FULL
+# chronological sequence first, only the kept RECORDS are truncated to the
+# tail).
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 MG_PATH = BASE_DIR / "raw_data/MulDiGraph/MulDiGraph.pkl"
@@ -169,15 +157,36 @@ def build_account_transactions(G, accounts: set[str], ts_max: float | None) -> d
     return seqs
 
 
-def sentence_for(transactions: list[dict]) -> str:
-    parts = []
+def raw_records_for(transactions: list[dict]) -> list[dict]:
+    """BERT_debug.md Task 1: THAY THE sentence_for() cu (da build san chuoi
+    van ban co dia chi CHINH CHU lap lai o moi dong -- xem STATUS.md muc "RA
+    SOAT CODE TIM NGUYEN NHAN", nguyen nhan goc gay sap AUPRC full-scale cua
+    nhanh BERT). Chi giu counterparty (dia chi DOI TAC, khong phai chinh no --
+    `in_out` da du suy ra vai tro from/to cua account chinh), amount, in_out,
+    timestamp (dung cho dedup lien tiep o Task 3) va n-gram.
+
+    Dedup (Task 3), anonymize dia chi doi tac (Task 2, ngau nhien lai theo
+    epoch) va tokenize WordPiece KHONG con lam o day nua -- chuyen sang luc
+    train/eval (xem inductive_model/data_prep/text_rendering.py) de tranh
+    "dong cung" 1 chuoi token co dinh vao corpus tinh."""
+    out = []
     for tx in transactions[-MAX_TX_PER_ACCOUNT_TEXT:]:
-        parts.append(
-            f"from: {tx['from']} to: {tx['to']} amount: {tx['amount']} in_out: {tx['in_out']} "
-            f"2-gram: {tx['2-gram']:.0f} 3-gram: {tx['3-gram']:.0f} "
-            f"4-gram: {tx['4-gram']:.0f} 5-gram: {tx['5-gram']:.0f}"
-        )
-    return "  ".join(parts) if parts else "no_transactions"
+        # Self-loop that (tx['from']==tx['to'], vd giao dich test-gas/contract
+        # tu goi chinh no) -- "counterparty" luc nay CHINH LA account dang
+        # xet, se lai lo dia chi chinh chu neu giu nguyen (~0.02% document
+        # thuc te, phat hien luc validate Task 1). Dung 1 token co dinh
+        # "[SELF_LOOP]" (KHONG phai hex address, giong het moi account nen
+        # khong lam lo danh tinh) thay vi bo qua han giao dich -- van giu
+        # tin hieu "co self-loop" cho model.
+        counterparty = "[SELF_LOOP]" if tx["from"] == tx["to"] else (tx["to"] if tx["in_out"] == 1 else tx["from"])
+        out.append({
+            "counterparty": counterparty,
+            "amount": tx["amount"],
+            "in_out": tx["in_out"],
+            "timestamp": tx["timestamp"],
+            "2gram": tx["2-gram"], "3gram": tx["3-gram"], "4gram": tx["4-gram"], "5gram": tx["5-gram"],
+        })
+    return out
 
 
 def main():
@@ -187,7 +196,6 @@ def main():
     ap.add_argument("--cap_val", type=int, default=500)
     ap.add_argument("--cap_test", type=int, default=500)
     ap.add_argument("--seed", type=int, default=44)
-    ap.add_argument("--tokenize_workers", type=int, default=16)
     ap.add_argument(
         "--balance", action="store_true",
         help="50/50-ish pos/neg subsample per partition (smoke-test mode). "
@@ -281,54 +289,38 @@ def main():
     address_to_index = {a: i for i, a in enumerate(account_list)}
     all_accounts = set(account_list)
 
-    sep("Build per-account transaction sequences + sentences")
+    sep("Build per-account transaction sequences + RAW records (Task 1: khong con self-address)")
     print("  ('train' text is naturally <=T_cutoff already; others use full history — transductive eval)")
+    print("  Dedup/anonymize/tokenize KHONG con lam o day -- xem inductive_model/data_prep/text_rendering.py")
     seqs = build_account_transactions(G, all_accounts, ts_max=None)
-    sentences = {a: sentence_for(seqs[a]) for a in all_accounts}
-
-    sep("Pre-tokenize with BERT WordPiece (train1.py's example2feature only .split()s on")
-    print("  whitespace -- it expects tokens already broken into vocab-valid wordpieces,")
-    print("  exactly like the original BERT_text_data.py: clean_str() + bert_tokenizer.tokenize().")
-    keys = list(sentences.keys())
-    n_workers = max(1, min(args.tokenize_workers, os.cpu_count() or 1))
-    print(f"  Tokenizing {len(keys):,} accounts with {n_workers} worker process(es) ...")
-    if n_workers == 1 or len(keys) < 2000:
-        _init_worker()
-        tokenized = [_tokenize_one(sentences[a]) for a in keys]
-    else:
-        with mp.Pool(n_workers, initializer=_init_worker) as pool:
-            tokenized = pool.map(_tokenize_one, (sentences[a] for a in keys), chunksize=256)
-    for a, t in zip(keys, tokenized):
-        sentences[a] = t
+    raw_records = {a: raw_records_for(seqs[a]) for a in all_accounts}
 
     def to_examples(addrs, label_dict):
         y = np.array([label_dict[a] for a in addrs], dtype=np.int64)
         y_prob = np.eye(2, dtype=np.float32)[y]
-        docs = [sentences[a] for a in addrs]
-        return y, y_prob, docs
+        return y, y_prob
 
     # Ground-truth arrays (isp) -- used for train_y (default target), and
     # ALWAYS for valid/test (never substitute isp_augmented there).
-    train_y, train_y_prob, train_docs = to_examples(pt_train, labels)
+    train_y, train_y_prob = to_examples(pt_train, labels)
     # Augmented arrays (isp_augmented) -- train1.py's flag decides whether
-    # to actually train on this instead of train_y. Docs are identical
+    # to actually train on this instead of train_y. Records are identical
     # (same accounts, same order), only the label differs.
-    train_y_augmented, train_y_augmented_prob, _ = to_examples(pt_train, isp_augmented)
+    train_y_augmented, train_y_augmented_prob = to_examples(pt_train, isp_augmented)
     train_sample_weight = np.array([propagation_weight[a] for a in pt_train], dtype=np.float32)
     n_train_propagated = sum(1 for a in pt_train if label_source[a] == "propagated_1hop")
     propagated_weights = {propagation_weight[a] for a in pt_train if label_source[a] == "propagated_1hop"}
     print(f"\n  train partition: {len(pt_train):,} accounts, {n_train_propagated:,} carry label_source=propagated_1hop "
           f"(sample_weight={sorted(propagated_weights) if propagated_weights else 'n/a'})")
 
-    valid_y, valid_y_prob, valid_docs = to_examples(pt_val, labels)
+    valid_y, valid_y_prob = to_examples(pt_val, labels)
     # test = pure_test + overlap, evaluated together but tagged for the 3-way breakdown
     test_addrs = pt_test + pt_overlap
     test_partition = ["pure_test"] * len(pt_test) + ["overlap"] * len(pt_overlap)
-    test_y, test_y_prob, test_docs = to_examples(test_addrs, labels)
+    test_y, test_y_prob = to_examples(test_addrs, labels)
 
-    shuffled_clean_docs = train_docs + valid_docs + test_docs
-    # doc_accounts[i] is the address behind shuffled_clean_docs[i] -- lets
-    # train1.py set guid = address_to_index[doc_accounts[i]] directly
+    # doc_accounts[i] is the address behind raw_records[doc_accounts[i]] --
+    # lets train1.py set guid = address_to_index[doc_accounts[i]] directly
     # instead of assuming guid == position (that positional assumption is
     # exactly the "vocab index mismatch" bug CONTEXT_SUMMARY.md documents
     # for the old B4E pipeline; account_list's vocab order and this doc
@@ -367,7 +359,7 @@ def main():
     save(valid_y_prob, "data_Dataset_MG.valid_y_prob")
     save(test_y, "data_Dataset_MG.test_y")
     save(test_y_prob, "data_Dataset_MG.test_y_prob")
-    save(shuffled_clean_docs, "data_Dataset_MG.shuffled_clean_docs")
+    save(raw_records, "data_Dataset_MG.raw_records")
     save(address_to_index, "data_Dataset_MG.address_to_index")
     save(test_partition, "data_Dataset_MG.test_partition")
     save(doc_accounts, "data_Dataset_MG.doc_accounts")

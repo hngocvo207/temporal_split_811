@@ -16,30 +16,33 @@ output/corpus rieng, xem STATUS.md). Mac dinh corpus_dir van tro ve dung thu
 muc 100k co san (runs/inductive_e2_corpus_100k/corpus) nen train_e2_v3.py van
 chay duoc NGAY CA KHI chua rebuild corpus lon hon -- mo rong corpus la buoc
 TUY CHON, tach biet voi warm-start tu pretrain.
+
+BERT_debug.md Task 1-2 (root-cause fix, xem STATUS.md muc "RA SOAT CODE"):
+corpus da doi tu shuffled_clean_docs (text tokenize san, co dia chi vi lap
+lai) sang raw_records (Task 1: khong self-address). Ham nay dong bo theo cung
+mau voi data_prep/e2_train_corpus.py -- tra ve Example mang `records` (chua
+anonymize), input_ids/attention_mask duoc dien vao moi epoch boi script train
+(xem data_prep/text_rendering.py::render_examples_inplace).
 """
 import pickle
 from pathlib import Path
 from typing import List
 
 import torch
-from pytorch_pretrained_bert.tokenization import BertTokenizer
 
-from data_prep.attempt3_corpus import MAX_SEQ_LEN, Example, _encode
+from data_prep.attempt3_corpus import MAX_SEQ_LEN, Example
 from data_prep.labels_io import _load_addr_to_idx
 
 REPO_ROOT = Path(__file__).resolve().parents[3]  # .../Dynamic_Fusion
 DEFAULT_CORPUS_DIR = REPO_ROOT / "runs" / "inductive_e2_corpus_100k" / "corpus"
 
 
-def load_e2_v3_train_examples(corpus_dir: Path = DEFAULT_CORPUS_DIR, tokenizer: BertTokenizer = None,
-                                max_examples: int = None) -> List[Example]:
-    tokenizer = tokenizer or BertTokenizer.from_pretrained("bert-base-uncased", do_lower_case=True)
-
+def load_e2_v3_train_examples(corpus_dir: Path = DEFAULT_CORPUS_DIR, max_examples: int = None) -> List[Example]:
     def _load_pickle(name: str):
         with open(corpus_dir / f"data_Dataset_MG.{name}", "rb") as f:
             return pickle.load(f, encoding="latin1")
 
-    shuffled_clean_docs = _load_pickle("shuffled_clean_docs")
+    raw_records = _load_pickle("raw_records")
     doc_accounts = _load_pickle("doc_accounts")
     train_y = _load_pickle("train_y")  # nhan strict (--labels_source labels.pkl luc build corpus)
     n_train = len(train_y)
@@ -49,18 +52,19 @@ def load_e2_v3_train_examples(corpus_dir: Path = DEFAULT_CORPUS_DIR, tokenizer: 
 
     examples = []
     for i in range(n_use):
-        addr = doc_accounts[i].lower()
+        raw_addr = doc_accounts[i]
+        addr = raw_addr.lower()
         if addr not in global_a2i:
             raise ValueError(f"doc {i} address {addr} not in global address_to_index")
-        input_ids, attention_mask = _encode(shuffled_clean_docs[i], tokenizer)
         examples.append(Example(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+            input_ids=None,
+            attention_mask=None,
             token_type_ids=torch.zeros(MAX_SEQ_LEN, dtype=torch.long),
             label=int(train_y[i]),
             label_strict=int(train_y[i]),
             global_idx=global_a2i[addr],
             address=addr,
             split="train",
+            records=raw_records[raw_addr],
         ))
     return examples

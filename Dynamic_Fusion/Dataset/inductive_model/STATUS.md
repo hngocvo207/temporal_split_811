@@ -1418,10 +1418,375 @@ dịch + tokenize — việc tốn thời gian hơn nhiều, tương tự quy m�
 `runs/expanded_test_attempt3/full_test_corpus/` ban đầu) — đây là việc RIÊNG,
 lớn hơn, chưa làm, cần xác nhận trước khi bắt tay vào.
 
-## Giai đoạn F — Quyết định scale
+## E2 v2 retrain SAU KHI sửa Direction — kết quả thật đầu tiên (2026-09-13 → 2026-09-14)
+
+Retrain `train_e2_v2.py` (BERT + GraphSAGE fusion, corpus 100k thật, optimizer
+riêng LR theo nhóm tham số: BERT 2e-5, graph/fusion/classifier 1e-3) chạy
+trong tmux `e2_v2_retrain`, khởi động 2026-09-13 21:51, **đã CHẠY XONG** (tmux
+session tự thoát sau khi hoàn tất, không còn chạy nữa) — 9 epoch (0-8), early
+stop tại epoch 8 (không cải thiện val AUPRC sau 4 epoch, patience=4), tổng
+~13.7h wall-clock (~5470s/epoch × 9), khớp ước tính ~91.5 phút/epoch đã đo.
+
+**best_epoch=4, best_val_auprc=0.1611** (đo trên val subsample cố định, 20,000
+account rút từ `overlap` thật 201,931, 217 dương, prevalence 1.08% — KHÔNG
+phải full pure_test). `best_threshold=0.9982` (chọn theo F1 tối ưu trên chính
+val subsample này).
+
+| epoch | train_loss | val AUPRC | val ROC-AUC | val F1(pos) | ghi chú |
+|---|---|---|---|---|---|
+| 0 | 0.129 | 0.1201 | 0.929 | 0.174 | *best* (auprc tăng) |
+| 1 | 0.081 | 0.1590 | 0.927 | 0.130 | *best* |
+| 2 | 0.046 | 0.1278 | 0.930 | 0.194 | |
+| 3 | 0.050 | 0.1588 | 0.931 | 0.221 | |
+| **4** | **0.013** | **0.1611** | **0.929** | **0.200** | ***best* — checkpoint được chọn** |
+| 5 | 0.016 | 0.1317 | 0.894 | 0.160 | |
+| 6 | 0.010 | 0.1428 | 0.895 | 0.221 | |
+| 7 | 0.096 | 0.0405 | 0.641 | 0.000 | sập tạm thời (train_loss cũng tăng vọt) |
+| 8 | 0.153 | 0.1184 | 0.885 | 0.207 | không hồi phục kịp trước patience hết |
+
+**Nhận xét quan trọng**: epoch 7 sập hẳn (AUPRC 0.143→0.040, ROC-AUC 0.895→0.641,
+F1=0 — model dự đoán gần như toàn 0), đúng lúc `train_loss` cũng tăng vọt
+(0.010→0.096) thay vì tiếp tục giảm — dấu hiệu mất ổn định tối ưu, nghi do LR
+1e-3 cho graph/fusion/classifier (được thêm vào từ ngoài, xem mục "E2 v2
+retrain" ở trên) hơi cao khi kết hợp với BERT vẫn đang fine-tune ở 2e-5. May
+mắn early-stopping đã chốt đúng epoch 4 (trước khi sập) làm checkpoint cuối
+nên **không ảnh hưởng tới checkpoint đã lưu**, nhưng đáng cân nhắc hạ LR nhóm
+graph/fusion/classifier (vd. 1e-3 → 3e-4) nếu train lại lần nữa để tránh lãng
+phí epoch.
+
+**So sánh sơ bộ (val subsample, CHƯA phải full-scale, chỉ mang tính định hướng)**:
+AUPRC 0.161 thấp hơn graph-only-thuần đã sửa bug (0.303, đo trên full
+pure_test) và GBM đã tune (0.347, full pure_test) — nhưng đây là 2 tập đo
+KHÁC NHAU (val subsample 20k/217 dương vs full pure_test 609,773/312 dương),
+**chưa thể kết luận fusion thua GBM/graph-only** từ số này. Đã chạy
+`eval_full_test.py` trên ĐÚNG full pure_test + overlap thật để so sánh công
+bằng — kết quả ở mục ngay dưới đây.
+
+## Eval full-scale E2 v2 (fusion) — KẾT QUẢ THẬT, PHÁT HIỆN QUAN TRỌNG MỚI (2026-09-14)
+
+Chạy `eval_full_test.py --checkpoint output/e2_v2_best_checkpoint.pt` (tmux
+`e2_v2_eval_full`) trên ĐÚNG full `pure_test` (609,773 account, 312 dương) +
+`overlap` (201,931, 217 dương) — cùng population đã dùng cho GBM và
+graph-only-thuần. Thời gian thật: pure_test 10,079s (~2.8h), overlap 3,345s
+(~0.9h), tổng ~3.7h.
+
+| metric | E2 v2 (fusion) | GBM (tuned) | graph-only (thuần, đã sửa bug) |
+|---|---|---|---|
+| AUPRC | **0.0495** | 0.3471 | 0.3025 |
+| ROC-AUC | 0.9788 | 0.9589 | **0.9836** |
+| F1(pos) | 0.1052 | **0.2099** | — |
+| Precision | 0.0668 | **0.1240** | — |
+| Recall | 0.2468 | **0.6827** | — |
+| P@100 | 0.07 | **0.72** | — |
+| P@1000 | 0.067 | **0.186** | 0.193 |
+| Recall@1000 | 0.2147 | **0.5962** | 0.619 |
+
+(overlap, tham khảo thêm: AUPRC=0.0193, ROC-AUC=0.9317, P@1000=0.035,
+Recall@1000=0.1613 — cùng xu hướng, còn thấp hơn cả pure_test.)
+
+**PHÁT HIỆN QUAN TRỌNG**: đây LÀ so sánh full-vs-full hợp lệ (không dính lỗi
+population-size như val-subsample-vs-full ở mục trên) — và kết quả đảo ngược
+hoàn toàn kỳ vọng: **fusion (BERT+graph) tệ hơn RẤT NHIỀU so với graph-only
+THUẦN** (AUPRC 0.0495 so với 0.3025 — giảm ~6×), dù fusion có nhiều thông tin
+hơn (cả graph lẫn text) chứ không ít hơn. Đáng chú ý ROC-AUC của fusion vẫn
+cao (0.979, chỉ kém graph-only một chút) — nghĩa là model vẫn xếp hạng đúng
+phần lớn dương/âm ở mức tổng thể, nhưng **sập hẳn ở đúng phần quan trọng
+nhất: top-K** (P@100 chỉ 0.07 so với GBM 0.72 — tệ hơn 10×). Đây là dấu hiệu
+kinh điển của **overconfident false positive ở đầu bảng xếp hạng** — model
+tự tin sai (threshold chọn được là 0.9982, cực cao) cho một nhóm account
+KHÔNG phải fraud nhưng bị đẩy lên top.
+
+## RÀ SOÁT CODE TÌM NGUYÊN NHÂN — ĐÃ XÁC NHẬN, KHÔNG PHẢI GIẢ THUYẾT (2026-09-15)
+
+Theo yêu cầu rà soát toàn bộ pipeline fusion để tìm lỗi sai. Đã loại trừ có hệ
+thống nhánh graph (giống hệt `train_graph_only_hypothesis.py` — cùng
+`LabelAwareNeighborSampler`, `GraphSAGEEncoder`, `subgraph_to_data`,
+`full_graph_forward`, đã CHỨNG MINH hoạt động đúng qua kết quả graph-only
+0.303) và định dạng corpus BERT (`mg_build_full_test_eval.py` import thẳng
+`sentence_for()` từ `mg_build_examples.py` — không có lệch định dạng train vs
+eval). **Nguyên nhân KHÔNG phải bug logic (sai chỉ số/off-by-one) mà là lỗi
+thiết kế nội dung đưa vào BERT — đã xác nhận bằng dữ liệu thật**:
+
+1. **Địa chỉ ví của chính account lặp lại trong mọi document, chiếm ~45% token
+   budget**: `sentence_for()` ([Dataset/mg_build_examples.py:172-180](../mg_build_examples.py#L172-L180))
+   build câu theo template `from: {addr} to: {addr} amount: ... in_out: ...`
+   cho mỗi giao dịch — vì account đang xét luôn đứng ở 1 trong 2 vế của MỌI
+   giao dịch của chính nó, địa chỉ 40-hex-char của nó lặp lại ở từng dòng.
+   `clean_str()` ([tri_model/utils.py:35-49](../tri_model/utils.py#L35-L49))
+   không hề ẩn danh địa chỉ. Kiểm tra thật 1 document dương trong
+   `runs/inductive_e2_corpus_100k/corpus/`: địa chỉ bị WordPiece tách thành
+   ~30 sub-token (`##6 ##85 ##44 ##5 ##fe...`), lặp lại mỗi dòng. Với
+   `MAX_SEQ_LEN=400` và front-truncate ([attempt3_corpus.py:58-60](../data_prep/attempt3_corpus.py#L58-L60)),
+   chỉ ~6 giao dịch lọt vào 398 token đầu → **~45% token của mỗi document chỉ
+   là chính địa chỉ ví của account đó lặp lại**.
+
+2. **Hệ quả — memorization thay vì học khái quát hoá**: `WeightedRandomSampler`
+   (pos:neg=1:4) trên corpus 100k qua 9 epoch khiến mỗi trong 519 document
+   dương được BERT nhìn thấy **~346 lần** (100,000 draw/epoch × 20% dương ÷
+   519 × 9 epoch). BERT 110M tham số học thuộc "chuỗi sub-token địa chỉ ví
+   X → nhãn 1" thay vì hành vi giao dịch khái quát — không transfer được sang
+   609,773 địa chỉ hoàn toàn mới ở pure_test. Khớp chính xác pattern quan
+   sát: ROC-AUC vẫn cao (0.979, tách được đa số ở mức tổng thể) nhưng P@100
+   sập còn 0.07 (top-confidence toàn false positive — dấu hiệu kinh điển của
+   overfit/memorization, không phải model kém tách biệt).
+
+3. Nhánh graph KHÔNG dính lỗi này vì không "nhìn" địa chỉ dưới dạng token văn
+   bản — chỉ dùng 23 đặc trưng số + cấu trúc đồ thị — nên khái quát hoá bình
+   thường (đúng lý do graph-only đạt 0.303 còn fusion sập xuống 0.0495 dù có
+   nhiều thông tin hơn).
+
+**Yếu tố phụ (đóng góp thêm, không phải nguyên nhân chính)**: graph_encoder
+trong `build_models()` ([train_eval/train_e2.py:69-78](../train_eval/train_e2.py#L69-L78))
+dùng hidden=128/out=128 cố định, KHÔNG phải cấu hình thắng sweep
+(hidden=64/out=64/mlp_classifier=True) — đối chiếu sweep thật
+(`output/graph_only_sweep_v2_fixed_direction_results.json`), hidden=128 với
+lr=0.003/mlp=True vẫn đạt AUPRC=0.221 (kém hơn 0.303 nhưng không thảm hoạ) —
+xác nhận đây KHÔNG đủ để giải thích gap 6× quan sát được, chỉ là 1 phần nhỏ.
+
+**Khuyến nghị sửa (chưa thực hiện, cần xác nhận trước khi làm)**: sửa
+`sentence_for()` để **ẩn danh địa chỉ ví** trước khi đưa vào BERT — thay
+`from: {addr} to: {addr}` bằng token cố định kiểu `from: [SELF]`/`[OTHER]`
+hoặc bỏ hẳn địa chỉ, chỉ giữ `amount`/`in_out`/n-gram (đặc trưng hành vi thật,
+không phải định danh) — rồi build lại corpus + train lại E2 v2 để kiểm chứng
+AUPRC full pure_test có phục hồi về gần mức graph-only (0.303) hay không.
+Song song, có thể cân nhắc bỏ hẳn nhánh BERT nếu graph-only-thuần (đã ngang
+GBM, rẻ hơn nhiều) đã đủ đáp ứng mục tiêu.
+
+## BERT_debug.md — sửa root cause nhánh text (Task 1-4) + train lại (2026-09-15)
+
+Theo kế hoạch chi tiết `BERT_debug.md` (do người dùng viết, dẫn chiếu BERT4ETH
+Hu et al. WWW'23 + TLMG4Eth + LMAE4Eth) — sửa đúng nguyên nhân đã xác nhận ở
+mục "RA SOAT CODE TIM NGUYEN NHAN" phía trên: địa chỉ ví lặp lại trong văn
+bản đưa vào BERT. Thực hiện Task 1-4, **chưa cần đến Task 5** (thay WordPiece
+bằng address embedding) — theo đúng tiêu chí "chỉ làm Task 5 nếu Task 1-4
+chưa đủ" (sau khi có kết quả full-scale mới sẽ đánh giá lại).
+
+### Task 1 — Loại self-address khỏi template
+
+`Dataset/mg_build_examples.py::raw_records_for()` (thay hẳn `sentence_for()`
+cũ) — record giờ chỉ có `counterparty` (địa chỉ ĐỐI TÁC), `amount`, `in_out`,
+`timestamp`, n-gram; KHÔNG còn field địa chỉ chính chủ. Phát hiện thêm 1 edge
+case lúc validate: 18/101,500 document ban đầu vẫn lộ địa chỉ do giao dịch
+**self-loop thật** (`tx['from']==tx['to']`, ví dụ gas-test/contract tự gọi) —
+`counterparty` lúc đó CHÍNH LÀ account đang xét. Sửa: dùng token cố định
+`"[SELF_LOOP]"` (không phải hex, giống hệt mọi account nên không lộ danh
+tính) cho case này thay vì bỏ giao dịch.
+
+**Validation (toàn bộ 101,500 document, không phải mẫu)**: 0/101,500 document
+còn lộ địa chỉ chính chủ (đúng kỳ vọng), sau khi sửa self-loop. Cũng verify
+0/811,704 trên corpus full_test.
+
+### Task 2 — Anonymize địa chỉ đối tác, random hoá lại mỗi EPOCH
+
+`Dataset/tri_model/utils.py::anonymize_addresses(records, rng)` — map địa chỉ
+đối tác duy nhất trong 1 document sang `addr0/addr1/...`, thứ tự gán lấy từ
+danh sách đã XÁO TRỘN bởi `rng` (không phải thứ tự xuất hiện thời gian thật)
+— cùng 1 địa chỉ thật ánh xạ sang ID khác nhau ở các lần gọi khác nhau. Thứ
+tự CHRONOLOGICAL của các giao dịch được giữ nguyên (chỉ ID là ngẫu nhiên).
+
+**Diễn giải phạm vi ngẫu nhiên hoá (khác 1 điểm so với chữ Y nguyên văn kế
+hoạch, ghi rõ để minh bạch — xem `data_prep/text_rendering.py` docstring)**:
+kế hoạch viết "random hoá lại mỗi lần document được sampler draw ra"; tiêu
+chí validation đi kèm chỉ đối chiếu **qua 2 epoch liên tiếp** (không yêu cầu
+biến thiên giữa các lần draw trong CÙNG 1 epoch) — nên đã triển khai render
+lại **1 lần/epoch** (không phải 1 lần/draw riêng lẻ): vẫn đạt đúng tiêu chí
+đã nêu, và tránh phải tokenize động trong DataLoader mỗi batch (phức tạp/rủi
+ro hơn nhiều, tốn CPU mỗi step thay vì mỗi epoch — đo thật: chỉ +10.3s/epoch
+trên 100,000 document, không đáng kể so với ~91.5 phút/epoch). Nếu sau khi
+có kết quả full-scale mà P@100 vẫn sập, đây là nơi đầu tiên cần xiết lại
+thành random-per-draw.
+
+**Validation (dữ liệu thật, 20 document dương)**: 20/20 document sinh ra
+chuỗi token KHÁC NHAU giữa `seed="train_epoch0"` và `seed="train_epoch1"`.
+
+### Task 3 — Dedup giao dịch liên tiếp
+
+`data_prep/text_rendering.py::dedup_consecutive()` — gộp giao dịch liền kề
+cùng counterparty (thật) + cùng `in_out`, timestamp cách nhau ≤72h, cộng dồn
+amount, giữ timestamp đầu, thêm field `count`. Chạy TRƯỚC anonymize (dedup
+theo địa chỉ thật, không theo ID đã xáo trộn).
+
+**Đo lường thật (BERT4ETH's metric: % giao dịch cùng counterparty với giao
+dịch liền trước, mẫu 85/100,000 account, mỗi 500 account lấy 1)**:
+repetitiveness TRƯỚC dedup = **0.6157**, SAU dedup = **0.3625** (giảm ~41%
+tương đối). Đúng như BERT4ETH ghi nhận: dedup liên tiếp một mình KHÔNG đủ
+(discontinuous repetitiveness ~36% vẫn còn) — đây chính là lý do Task 2's
+random-hoá theo epoch là **bắt buộc đi kèm**, không phải optional.
+
+### Task 4 — Giảm rủi ro overfit do oversampling
+
+`train_eval/train_e2.py::train_one_epoch()` + `train_eval/train_e2_v2.py`:
+- `--pos-neg-ratio` mặc định giảm **4.0 → 2.0**.
+- `--pos-weight` (tuỳ chọn, mặc định tắt): class-weighted CE loss độc lập với
+  tỉ lệ sample, sẵn sàng dùng nếu 2.0 chưa đủ.
+- `--selection-metric` mặc định đổi từ `auprc` sang **`p_at_100`** (chọn
+  checkpoint + early-stop theo P@100 trên val thay vì AUPRC/loss) — đúng yêu
+  cầu "đổi tiêu chí early stopping sang theo dõi P@K, dừng khi P@100 giảm dù
+  loss/AUC vẫn cải thiện".
+
+### Kiến trúc chung — chuyển sang render động (không còn corpus tĩnh)
+
+`data_prep/text_rendering.py` (mới): `dedup_consecutive()` + `anonymize_addresses()`
++ template (Task 1, không còn field self-address) + tokenize WordPiece, gộp
+thành `render_document()`/`render_corpus()` (multiprocessing)/`render_examples_inplace()`.
+`mg_build_examples.py`/`mg_build_full_test_eval.py` giờ chỉ lưu `raw_records`
+(dict address -> list record thô, CHƯA anonymize) thay vì `shuffled_clean_docs`
+(text đã tokenize sẵn) — dedup/anonymize/tokenize chuyển hẳn sang lúc
+train/eval. `Example` (`attempt3_corpus.py`) thêm field `records` (raw, cho
+train — input_ids/attention_mask để `None`, được `train_e2_v2.py` điền lại
+mỗi epoch) — `full_test_corpus.py` (val/test, dùng seed cố định `"eval_full_test"`,
+1 lần, có **cache** riêng `rendered_eval_full_test.pkl` để các lần chạy script
+sau không phải tokenize lại 811,704 document mỗi lần khởi động, xem
+`RENDERED_CACHE_PATH` — đo thật: lần đầu 60.3s, từ cache 39.3s, output khớp
+bit-for-bit).
+
+**Đã đồng bộ luôn `data_prep/e2_v3_train_corpus.py` (E2 v3, "cần chạy lại"
+riêng) để không bị hỏng silently do đổi format corpus** — nhưng chỉ render
+TĨNH 1 lần (chưa wire per-epoch như E2 v2, vì E2 v3 không nằm trong phạm vi
+BERT_debug.md, đang chờ GraphMAE pretrain lại trước — xem mục G1b). Bộ
+ablation (`train_e2_ablation.py`) không bị hỏng (chỉ gọi `load_e2_train_examples()`
+đã sửa) nhưng cũng CHƯA wire per-epoch render — vẫn ở trạng thái "cần chạy
+lại nếu muốn".
+
+### Bổ sung theo yêu cầu: F1(pos) ở threshold mặc định VÀ threshold tối ưu
+
+Thêm vào `train_eval/metrics.py` (đã có sẵn `find_best_f1_threshold`, không
+đổi) và báo cáo ở **cả 3 model** để so sánh công bằng, cùng phương pháp (quét
+threshold trên VAL, áp sang test, không nhìn trộm):
+- `train_eval/gbm_baseline.py`: thêm threshold tối ưu quét trên `val`
+  partition, lưu cả `final_full_test_metrics` (threshold=0.5) và
+  `final_full_test_metrics_best_threshold` vào `gbm_hparam_sweep_result.json`.
+- `train_eval/train_graph_only_hypothesis.py`: tách `compute_probs_by_split()`
+  khỏi `evaluate()`, thêm bảng F1 threshold mặc định vs tối ưu vào output cuối.
+- `train_eval/train_e2_v2.py`: báo cáo cả `val_metrics_at_default_threshold`
+  và `val_metrics_at_best_threshold` trong `e2_v2_train_history.json`.
+- `train_eval/eval_full_test.py`: tính probs **1 LẦN DUY NHẤT** (tránh forward
+  2 lần, tốn thêm ~3-4h) rồi suy ra metric ở cả 2 threshold; đọc
+  `GBM_TUNED_REFERENCE` trực tiếp từ `gbm_hparam_sweep_result.json` (không
+  hardcode nữa) để luôn khớp lần chạy GBM gần nhất, in bảng so sánh riêng cho
+  từng threshold.
+
+### Kết quả retrain THẬT sau BERT_debug.md (2026-09-15 → 2026-09-16, tmux `e2_v2_retrain_v2`)
+
+Đã build lại corpus thật (không phải mô phỏng): `mg_build_examples.py --cap_train
+100000` (30.5s, giảm mạnh so với bản cũ vì không còn tokenize lúc build) và
+`mg_build_full_test_eval.py` (67.4s cho 811,704 account). Smoke-test đầy đủ
+pipeline mới (corpus 2,000 doc, 2 epoch, `--no-wandb`) chạy hết không lỗi
+trước khi launch thật.
+
+**Train xong**: 6 epoch (0-5), early-stop tại epoch 5 (không cải thiện
+`p_at_100` sau 4 epoch, đúng tiêu chí Task 4), ~5,460s/epoch (~1.5h/epoch,
+KHÔNG đổi nhiều so với bản trước dù có render lại mỗi epoch — chỉ +10-11s/epoch).
+**best_epoch=1**, chọn theo `p_at_100` (Task 4):
+
+| epoch | train_loss | val AUPRC | val P@100 | val ROC-AUC | val F1(pos)@0.5 |
+|---|---|---|---|---|---|
+| 0 | 0.121 | 0.318 | 0.53 | 0.961 | 0.195 |
+| **1** | **0.036** | **0.353** | **0.58** | **0.952** | **0.203** | ***best (p_at_100)*** |
+| 2 | 0.029 | 0.288 | 0.47 | 0.927 | 0.322 |
+| 3 | 0.022 | 0.285 | 0.39 | 0.937 | 0.372 |
+| 4 | 0.020 | 0.193 | 0.26 | 0.926 | 0.299 |
+| 5 | 0.016 | 0.145 | 0.26 | 0.727 | 0.268 |
+
+`best_threshold=0.9969` (quét trên val): F1(pos)@0.5=0.2032 vs F1(pos)@threshold-tối-ưu=**0.4354**.
+
+**So với bản pre-BERT_debug.md (cùng val subsample, threshold mặc định vô
+hiệu vì đổi selection-metric)**: val AUPRC tại best_epoch tăng từ **0.161 →
+0.353** (~2.2×), val P@100=0.58 (metric mới, chưa có số cũ để so trực tiếp
+vì bản trước không track P@100 lúc train) — dấu hiệu RÕ RỆT rằng việc ẩn
+danh địa chỉ đã giúp nhánh BERT học được tín hiệu khái quát hoá hơn nhiều
+trên val. **Đây mới là val subsample (20k, không phải full pure_test) — số
+quyết định thật vẫn phải chờ `eval_full_test.py` chạy trên đúng 609,773
+pure_test + 201,931 overlap, xem mục ngay dưới.**
 
 ## Giai đoạn F — Quyết định scale
-- [ ] F1, F2, F3 — TẠM DỪNG, chờ train lại E2 v2/GraphMAE dưới quy ước hướng cạnh đã sửa trước khi quyết định (xem mục "KẾT QUẢ SWEEP V2" ở trên — kết luận "không scale fusion" trước đó không còn cơ sở)
+- [ ] F1, F2, F3 — TẠM DỪNG, chờ kết quả full-scale eval E2 v2 SAU BERT_debug.md (đang train lại, xem mục ngay trên) trước khi quyết định
 
 ## Giai đoạn G — Dọn dẹp & tài liệu
-- [ ] G1, G2, G3 — có thể làm song song
+- [x] G1 — Xoá checkpoint/log/kết quả pre-fix không còn giá trị (2026-09-13)
+
+Theo yêu cầu: rà soát `output/` và xoá các file "không còn giá trị sử dụng".
+Tiêu chí xoá = phụ thuộc `sample_union_subgraph` (GraphSAGE) và được train/tạo
+**trước** ngày sửa bug hướng cạnh 2026-09-06 (xem mục "SỬA LẠI LẦN 2" — mọi
+checkpoint loại này học sai quy ước, không còn đáng tin theo đúng tuyên bố đã
+ghi ở trên). Đã liệt kê cho người dùng xác nhận trước, sau đó xoá theo lựa
+chọn "xoá toàn bộ".
+
+**Đã xoá (25 file, ~2.5GB)**: `e2_best_checkpoint.pt`+`e2_final_metrics.json`
+(E2 v1, còn dính cả bug nhãn lan truyền); `graph_only_sweep_results.json`
+(pre-fix, đã có `graph_only_sweep_v2_fixed_direction_results.json` thay thế);
+`e2_v2_train.log`; `graph_encoder_pretrained.pt`+`graph_pretrain_history.json`
+(GraphMAE pretrain pre-fix); `e2_v2_eval_full.log`+`e2_v2_full_eval_result.json`;
+`e2_v3_best_checkpoint.pt`+`e2_v3_train_history.json`+`e2_v3_train.log`;
+`e2_ablation_pos{25,50,75,100}_checkpoint.pt`+`*_result.json` (toàn bộ chuỗi
+ablation dùng để kết luận "fusion thua GBM 8×" — kết luận đã bị rút lại);
+`e2_ablation_matched_pool_curve.json`, `e2_ablation_sequence.log`,
+`eval_ablation_matched_pool.log`; `e2_v2_train_split_eval.json`,
+`e2_v2_train_vs_test_matched_pool.json`; `e2_v2_eval_full_FIXED_edgedir.log`
+(347B, phép eval bị huỷ giữa chừng, rỗng); `gbm_graphmae_embedding_result.json`
+(ăn theo embedding GraphMAE pre-fix, cũng không còn đáng tin).
+
+**Giữ lại**: mọi `gbm_*` khác (không đi qua `sample_union_subgraph`, không dính
+bug) — `gbm_baseline_result.json`, `gbm_full_scale_analysis.json`,
+`gbm_handcrafted_graph_result{,_v2}.json`, `gbm_hparam_sweep_result.json`,
+`gbm_learning_curve_result.json`, `gbm_matched_negset_result.json`;
+`graph_only_hypothesis_model.pt`/`result.json` (09-06 23:23, SAU fix);
+`graph_only_sweep_v2_fixed_direction_results.json`+log (09-07, SAU fix);
+`handcrafted_graph_features.npy`/`_names.json`; `run_ablation_sequence.sh`
+(script, tái dùng được); `e2_v2_best_checkpoint.pt`/`e2_v2_retrain.log`/
+`e2_v2_train_history.json` (09-13, đang train lại — xem mục retrain ở trên).
+`output/` giảm từ 3.0GB → 522MB.
+
+**Không xoá** `data/preprocessed/Dataset_MG_v2_quantile/` (746MB, split trung
+gian đã bị thay bởi v3_no_overlap) — theo quyết định trước đó là giữ lại để
+đối chiếu lịch sử; script `mg_temporal_pipeline_v2_quantile.py` build lại được
+bất cứ lúc nào nên không mất thông tin nếu sau này muốn xoá.
+
+- [x] G1b — Xoá script báo cáo kết quả không còn giá trị + gắn cờ "cần chạy lại" (2026-09-13)
+
+Theo yêu cầu tiếp theo: rà `STATUS.md` để tìm SCRIPT (không chỉ output) không còn
+giá trị, xoá hẳn; script nào output đã xoá ở G1 nhưng bản thân script vẫn còn
+giá trị (còn nằm trong kế hoạch, hoặc thiết kế thí nghiệm vẫn đúng, chỉ là
+input bị bug hướng cạnh) thì GIỮ script, chỉ đổi trạng thái thành "cần chạy
+lại" thay vì xoá.
+
+**Đã xoá (2 script, không còn ai import, không còn lý do chạy lại)**:
+- `train_eval/sweep_graph_only.py` (08-27, sweep 12 config, pre-fix) — đã bị
+  thay thế HOÀN TOÀN bởi `sweep_graph_only_v2.py` (24 config, quy ước hướng
+  cạnh đúng); không có lý do gì để chạy lại bản cũ.
+- `train_eval/eval_diagnostic.py` (08-28) — script chẩn đoán 1 lần để tách 2
+  nguyên nhân gây sập F1 full-scale (nhãn lan truyền vs tỉ lệ dương cực thấp);
+  mục tiêu điều tra đã xong và đã được vá tận gốc (chuyển sang nhãn strict +
+  corpus 100k thật ở `e2_train_corpus.py`) — không script nào khác import,
+  không còn lý do chạy lại.
+
+**GIỮ script, đổi trạng thái "CẦN CHẠY LẠI" (output đã bị xoá ở G1 nhưng thiết
+kế thí nghiệm vẫn đúng)**:
+- `train_eval/pretrain_graph_encoder.py` (GraphMAE pretrain) — **CẦN CHẠY
+  LẠI**, nằm trong kế hoạch đã ghi ("Việc cần làm tiếp" ở mục BUG hướng cạnh):
+  bug đã sửa (`.T.tocsr()`), nhưng chưa pretrain lại lần nào kể từ đó.
+- `train_eval/train_e2_v3.py` + `data_prep/e2_v3_train_corpus.py` (E2 v3,
+  warm-start từ GraphMAE) — **CẦN CHẠY LẠI**, phụ thuộc kết quả
+  `pretrain_graph_encoder.py` ở trên, chưa chạy lại được vì bước phụ thuộc
+  chưa xong.
+- `train_eval/train_e2_ablation.py` + `data_prep/e2_ablation_corpus.py` +
+  `train_eval/eval_ablation_matched_pool.py` + `output/run_ablation_sequence.sh`
+  (learning curve fusion theo %dương 25/50/75/100%) — **CẦN CHẠY LẠI NẾU
+  MUỐN** (không bắt buộc, chưa lên lịch): kết luận cũ ("fusion thua GBM 8×")
+  đã bị rút lại vì dùng checkpoint pre-fix, nhưng bản thân thiết kế thí
+  nghiệm (nested subset theo seed cố định, so matched-pool) vẫn đúng và có
+  thể tái sử dụng nguyên vẹn dưới quy ước hướng cạnh đã sửa — ưu tiên thấp
+  hơn E2 v2/E2 v3 theo đúng thứ tự đã chọn.
+
+**Lưu ý phát hiện thêm (không phải việc cần làm, chỉ ghi lại cho minh bạch)**:
+`gbm_learning_curve.py` và `gbm_full_eval.py` (nhắc tới ở 2 mục GBM phía trên)
+chưa từng được lưu vào repo — giống trường hợp `gbm_hparam_sweep.py` đã phát
+hiện trước đó, đây là script tạm trong scratchpad của phiên làm việc trước.
+Khác với `gbm_hparam_sweep.py` (đã được viết lại thành `gbm_baseline.py`
+vĩnh viễn), 2 script này CHƯA được viết lại — nhưng kết quả của chúng
+(`output/gbm_learning_curve_result.json`, `output/gbm_full_scale_analysis.json`)
+không bị ảnh hưởng bởi bug hướng cạnh nên vẫn dùng được, KHÔNG cần chạy lại;
+chỉ là nếu muốn tái tạo lại từ đầu thì hiện chưa có script trong repo để làm
+việc đó.
+
+- [ ] G2, G3 — có thể làm song song
