@@ -37,6 +37,7 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import torch.nn as nn
+from torch_geometric.data import Data
 
 import pickle
 
@@ -49,6 +50,21 @@ from train_eval.metrics import compute_metrics, find_best_f1_threshold
 
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "output"
 GLOBAL_SEED = 44
+
+
+def load_top_k_feature_cols(k: int) -> list:
+    """Doc DUNG thu tu xep hang |corr| da chot o
+    feature_count_ablation_multiseed.py (K*=7, xem STATUS.md muc 'Xac nhan
+    multi-seed') tu ket qua da luu san, thay vi tinh lai xep hang o day --
+    dam bao dung 100% cung 7 cot da duoc validate qua 5 seed, khong lech do
+    tinh lai tren du lieu/thu tu khac."""
+    result_path = OUTPUT_DIR / "feature_count_ablation_multiseed_result.json"
+    with open(result_path) as f:
+        ranking = json.load(f)["feature_ranking"]  # list [name, col_idx, |corr|], da sort giam dan
+    cols = [int(col_idx) for _, col_idx, _ in ranking[:k]]
+    names = [name for name, _, _ in ranking[:k]]
+    print(f"Top-{k} feature cols (tu feature_count_ablation_multiseed_result.json): {names} -> cols={cols}")
+    return cols
 
 
 def _load_labels_partition_from_dir(split_dir: Path):
@@ -132,7 +148,7 @@ def make_epoch_batches(pos_idx: torch.Tensor, neg_idx: torch.Tensor, neg_ratio: 
 
 
 def train(args, idx=None, labels=None, node_features=None, adj_train=None, verbose=True, wandb_run=None,
-          split_dir: Path = None):
+          split_dir: Path = None, feature_cols: list = None):
     """args cần: epochs, batch_size, neg_ratio, lr, eval_every, weight_decay,
     hidden, out, dropout, mlp_classifier, patience (early stop theo val AUPRC
     -- CHỌN MODEL BẰNG VAL, KHÔNG BẰNG pure_test/test, để không "nhìn trộm" tập
@@ -150,13 +166,17 @@ def train(args, idx=None, labels=None, node_features=None, adj_train=None, verbo
         idx, labels = build_partition_indices(split_dir=split_dir)
     if node_features is None:
         node_features = load_node_features()
+    if feature_cols is not None:
+        node_features = node_features[:, feature_cols].contiguous()
     if adj_train is None:
         adj_dir = Path(split_dir) if split_dir is not None else PREPROC_DIR
         adj_train = sp.load_npz(adj_dir / "adj_train.npz")
     sampler = LabelAwareNeighborSampler(adj_train, labels, seed=GLOBAL_SEED)
 
+    in_channels = len(feature_cols) if feature_cols is not None else 23
     model = GraphOnlyClassifier(
-        hidden=args.hidden, out=args.out, dropout=args.dropout, mlp_classifier=args.mlp_classifier
+        in_channels=in_channels, hidden=args.hidden, out=args.out, dropout=args.dropout,
+        mlp_classifier=args.mlp_classifier
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     rng = torch.Generator().manual_seed(GLOBAL_SEED)
@@ -192,7 +212,7 @@ def train(args, idx=None, labels=None, node_features=None, adj_train=None, verbo
             wandb_run.log({"train_loss": avg_loss, "epoch_time_s": dt}, step=epoch)
 
         if (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1:
-            metrics = evaluate(model, idx, labels, device)
+            metrics = evaluate(model, idx, labels, device, feature_cols=feature_cols)
             log["eval"] = metrics
             val_auprc = metrics["val"]["auprc"]
             improved = val_auprc > best_val_auprc
@@ -236,7 +256,7 @@ def _get_graph_inference():
 
 @torch.no_grad()
 def compute_probs_by_split(model: GraphOnlyClassifier, idx: dict, labels: torch.Tensor, device: torch.device,
-                            eval_splits=None) -> dict:
+                            eval_splits=None, feature_cols: list = None) -> dict:
     """Tach rieng phan tinh probs (dung chung cho evaluate() va cho viec quet
     threshold F1 tren val, xem main()) -- cung mau train_e2.py::compute_probs_labels."""
     eval_splits = eval_splits if eval_splits is not None else idx.get("_eval_splits", ["val", "overlap", "pure_test"])
@@ -249,6 +269,11 @@ def compute_probs_by_split(model: GraphOnlyClassifier, idx: dict, labels: torch.
     original_device = next(model.parameters()).device
     model.to("cpu")
     graph_inference = _get_graph_inference()
+    if feature_cols is not None:
+        # Slice CHỈ x (khong dung mutate cache dung chung) -- giu edge_index/
+        # edge_weight nguyen ban, khop dung so cot model duoc train.
+        graph_inference = Data(x=graph_inference.x[:, feature_cols].contiguous(),
+                                edge_index=graph_inference.edge_index, edge_weight=graph_inference.edge_weight)
     logits_all = model.full_graph_logits(graph_inference, torch.device("cpu"))
     model.to(original_device)
     probs_all = torch.softmax(logits_all, dim=-1)[:, 1].numpy()
@@ -264,8 +289,9 @@ def compute_probs_by_split(model: GraphOnlyClassifier, idx: dict, labels: torch.
 
 @torch.no_grad()
 def evaluate(model: GraphOnlyClassifier, idx: dict, labels: torch.Tensor, device: torch.device,
-             eval_splits=None) -> dict:
-    probs_by_split = compute_probs_by_split(model, idx, labels, device, eval_splits=eval_splits)
+             eval_splits=None, feature_cols: list = None) -> dict:
+    probs_by_split = compute_probs_by_split(model, idx, labels, device, eval_splits=eval_splits,
+                                             feature_cols=feature_cols)
     return {split: compute_metrics(y_true, y_prob, k_list=[1000]) for split, (y_true, y_prob) in probs_by_split.items()}
 
 
@@ -305,8 +331,13 @@ def main():
                           "(train/val/test, khong overlap) -- xem STATUS.md")
     ap.add_argument("--output-suffix", type=str, default="",
                      help="hau to ten file output (vd '_v3') de khong ghi de ket qua split cu")
+    ap.add_argument("--top-k-features", type=int, default=None,
+                     help="mac dinh None = dung du 23 dac trung (hanh vi CU). Truyen vd 7 de chi dung "
+                          "top-7 dac trung theo |corr| da chot o feature_count_ablation_multiseed.py "
+                          "(K*=7, xem STATUS.md muc 'Xac nhan multi-seed') thay vi ca 23 cot.")
     args = ap.parse_args()
     split_dir = Path(args.split_dir) if args.split_dir else None
+    feature_cols = load_top_k_feature_cols(args.top_k_features) if args.top_k_features else None
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     idx, labels = build_partition_indices(split_dir=split_dir)
@@ -316,9 +347,10 @@ def main():
     baselines = naive_baselines(idx, labels, eval_splits=eval_splits)
     print(json.dumps(baselines, indent=2))
 
-    model, history, idx, labels, best_epoch, best_val_auprc = train(args, split_dir=split_dir)
+    model, history, idx, labels, best_epoch, best_val_auprc = train(args, split_dir=split_dir,
+                                                                     feature_cols=feature_cols)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    final_eval = evaluate(model, idx, labels, device, eval_splits=eval_splits)
+    final_eval = evaluate(model, idx, labels, device, eval_splits=eval_splits, feature_cols=feature_cols)
 
     print(f"\n=== FINAL RESULT (model = best val AUPRC checkpoint, epoch {best_epoch}) ===")
     print(json.dumps(final_eval, indent=2))
@@ -328,7 +360,8 @@ def main():
     # F1(pos) o threshold mac dinh (0.5, da co trong final_eval) VA threshold
     # TOI UU (quet tren val, ap sang strict_test_name) -- cung phuong phap
     # voi gbm_baseline.py/train_e2_v2.py de so sanh cong bang giua 3 model.
-    probs_by_split = compute_probs_by_split(model, idx, labels, device, eval_splits=eval_splits)
+    probs_by_split = compute_probs_by_split(model, idx, labels, device, eval_splits=eval_splits,
+                                             feature_cols=feature_cols)
     val_y, val_prob = probs_by_split["val"]
     best_threshold = find_best_f1_threshold(val_y, val_prob)
     test_y, test_prob = probs_by_split[strict_test_name]
@@ -345,7 +378,8 @@ def main():
                    "best_epoch": best_epoch, "best_val_auprc": best_val_auprc,
                    "best_threshold": best_threshold,
                    f"final_eval_{strict_test_name}_best_threshold": m_test_best_t,
-                   "split_dir": str(split_dir or PREPROC_DIR), "args": vars(args)}, f, indent=2)
+                   "split_dir": str(split_dir or PREPROC_DIR), "args": vars(args),
+                   "feature_cols": feature_cols}, f, indent=2)
     torch.save(model.state_dict(), OUTPUT_DIR / f"graph_only_hypothesis_model{suffix}.pt")
 
 

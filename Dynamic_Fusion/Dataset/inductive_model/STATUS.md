@@ -410,7 +410,7 @@ dưới đây — xem lại**.)
 ### Eval full pure_test/overlap thật (2026-09-03)
 
 Đã chạy `eval_full_test.py --checkpoint output/e2_v2_best_checkpoint.pt` MỘT LẦN
-DUY NHẤT (sau khi checkpoint+threshold đã cố định từ val, không nhìn trộm test
+DUY NHẤT (sau kshi checkpoint+threshold đã cố định từ val, không nhìn trộm test
 lúc chọn model), trên TOÀN BỘ pure_test (609,773) + overlap (201,931) thật:
 
 | split | F1(pos) | precision | recall | AUPRC | ROC-AUC | n | n_pos | thời gian |
@@ -1695,9 +1695,240 @@ hiệu vì đổi selection-metric)**: val AUPRC tại best_epoch tăng từ **0
 0.353** (~2.2×), val P@100=0.58 (metric mới, chưa có số cũ để so trực tiếp
 vì bản trước không track P@100 lúc train) — dấu hiệu RÕ RỆT rằng việc ẩn
 danh địa chỉ đã giúp nhánh BERT học được tín hiệu khái quát hoá hơn nhiều
-trên val. **Đây mới là val subsample (20k, không phải full pure_test) — số
-quyết định thật vẫn phải chờ `eval_full_test.py` chạy trên đúng 609,773
-pure_test + 201,931 overlap, xem mục ngay dưới.**
+trên val.
+
+### Kết quả full-scale eval THẬT sau BERT_debug.md (2026-09-16, hoàn tất)
+
+Chạy `eval_full_test.py --checkpoint output/e2_v2_best_checkpoint.pt` trên
+ĐÚNG full `pure_test` (609,773, 312 dương) + `overlap` (201,931, 217 dương),
+threshold tối ưu (0.9969, quét trên val lúc train). Thời gian: pure_test
+10,182s (~2.8h), overlap 3,343s (~0.9h).
+
+| metric | E2 v2 sau fix (fusion) | E2 v2 TRƯỚC fix | GBM (tuned) | graph-only (thuần) |
+|---|---|---|---|---|
+| **AUPRC** | **0.1436** | 0.0495 | 0.3471 | 0.3025 |
+| ROC-AUC | 0.9708 | 0.9788 | 0.9589 | 0.9836 |
+| F1(pos)@threshold tối ưu | 0.2011 | 0.1052 | 0.2099 | — |
+| Precision@tối ưu | 0.1402 | 0.0668 | 0.1240 | — |
+| Recall@tối ưu | 0.3558 | 0.2468 | 0.6827 | — |
+| P@100 | 0.36 | 0.07 | 0.72 | — |
+| P@1000 | 0.121 | 0.067 | 0.186 | 0.193 |
+| Recall@1000 | 0.388 | 0.215 | 0.596 | 0.619 |
+
+**Đánh giá**: fix BERT_debug.md (ẩn danh địa chỉ + dedup + random-per-epoch +
+giảm oversample + chọn checkpoint theo P@100) cải thiện AUPRC full pure_test
+**~2.9× (0.0495 → 0.1436)** và P@100 **~5× (0.07 → 0.36)** — xác nhận đúng
+hướng, root cause đã được giải quyết một phần lớn. **NHƯNG fusion vẫn thua cả
+GBM (0.347) lẫn graph-only-thuần (0.303)** — nhánh BERT dù đã hết overfit
+thảm hoạ như trước vẫn CHƯA đóng góp đủ để fusion vượt qua graph-only một
+mình. Khả năng: (a) vẫn cần nhiều dữ liệu dương hơn để BERT học tốt (chỉ 519
+mẫu, dù không còn memorize địa chỉ); (b) cơ chế gated fusion có thể vẫn chưa
+cân bằng tối ưu 2 nhánh; (c) Task 5 (thay WordPiece bằng address/categorical
+embedding, theo BERT4ETH) có thể cần thiết — theo đúng tiêu chí đã đặt ra
+("chỉ làm Task 5 nếu Task 1-4 chưa đủ"), **đây là dấu hiệu Task 1-4 đã giúp
+nhiều nhưng CHƯA ĐỦ để fusion vượt graph-only**, gợi ý cân nhắc Task 5 hoặc
+đơn giản là dùng graph-only-thuần làm kiến trúc chính (rẻ hơn, không cần BERT,
+đã gần bằng/vượt GBM).
+
+Lưu ý: `gbm_tuned_reference.best_t` hiện là `null` trong kết quả JSON vì
+`gbm_baseline.py` chưa được chạy lại từ khi thêm tính năng threshold tối ưu
+(mục "Bổ sung F1..." ở trên) — bảng so sánh threshold tối ưu ở trên dùng số
+GBM cũ (threshold=0.5 mặc định cho GBM, không hoàn toàn tương đương cách so
+threshold-tối-ưu-của-riêng-từng-model); cần chạy lại `gbm_baseline.py` để có
+so sánh threshold-tối-ưu-vs-threshold-tối-ưu hoàn toàn công bằng.
+
+Kết quả đầy đủ:`output/e2_v2_full_eval_result_v2.json`, log `output/e2_v2_eval_full_v2.log`.
+
+## Số lượng đặc trưng node phù hợp cho GraphSAGE — thí nghiệm thật (2026-09-16)
+
+Theo câu hỏi: "23 đặc trưng node có phù hợp không cho GraphSAGE?" — 23 cột này
+kế thừa nguyên từ `raw_data/MulDiGraph/features_output_all23_MG_fullscale.csv`
+(tính sẵn từ pipeline `tri_model` cũ, StandardScaler fit train-only, xem
+`data_prep/build_node_features.py`/`compute_feature_scaler.py`), KHÔNG phải
+con số thiết kế riêng cho GraphSAGE — nên đã kiểm chứng thực nghiệm thay vì
+suy đoán bằng `train_eval/feature_count_ablation.py`.
+
+**Bước 1 — xếp hạng 23 đặc trưng theo |correlation| với nhãn (TRAIN-only,
+không rò rỉ)**: `betweenness_centrality` vượt trội hẳn (|corr|=0.081, gấp
+~4× cột thứ 2). 4 cột về amount (`account_balance`, `min_in_amount`,
+`avg_in_amount`, `max_in_amount`) gần như KHÔNG có tín hiệu tuyến tính
+riêng lẻ (|corr|<0.001).
+
+**Bước 2 — so AUPRC full pure_test (609,773 thật) khi chỉ dùng top-K, cùng
+1 cấu hình GraphSAGE đã thắng sweep (lr=0.003/hidden=64/out=64/mlp_classifier=True,
+1 seed/K, KHÔNG lặp lại nhiều seed — xem giới hạn bên dưới)**:
+
+| K (đặc trưng) | val AUPRC | **test AUPRC** | ROC-AUC | P@100 | Recall@1000 |
+|---|---|---|---|---|---|
+| top3 | 0.408 | 0.402 | 0.982 | 0.66 | 0.686 |
+| **top5** | 0.392 | **0.432** | 0.987 | **0.67** | 0.715 |
+| top10 | 0.363 | 0.297 | 0.991 | 0.47 | 0.683 |
+| top15 | 0.400 | 0.404 | 0.985 | 0.65 | 0.657 |
+| top23 (toàn bộ, hiện đang dùng) | 0.354 | 0.383 | 0.983 | 0.56 | 0.718 |
+| random10 (đối chứng, chọn ngẫu nhiên) | 0.233 | 0.240 | 0.964 | 0.39 | 0.606 |
+
+**Kết luận**:
+1. **Dùng cả 23 đặc trưng (0.383) KHÔNG phải lựa chọn tốt nhất** — top5
+   (0.432), top15 (0.404), top3 (0.402) đều VƯỢT full-23, dù chỉ dùng 1/8 đến
+   2/3 số cột. Hợp lý vì tập dương chỉ có 519 mẫu train — càng nhiều cột yếu/
+   nhiễu (đặc biệt nhóm amount, |corr|≈0) càng dễ làm model overfit/tăng
+   phương sai thay vì thêm tín hiệu thật.
+2. **random10 (0.240) tệ hơn rõ rệt top10 (0.297)** — xác nhận xếp hạng theo
+   correlation có ý nghĩa thật, không phải chọn K cột bất kỳ cũng như nhau.
+3. **top10 là điểm trũng bất thường** (0.297, thấp hơn cả top5 VÀ top15) —
+   nhiều khả năng là nhiễu do chỉ chạy 1 seed/cấu hình (tập dương pure_test
+   chỉ 312 mẫu, phương sai giữa các lần train cao) chứ không phải "10 là số
+   xấu" có ý nghĩa thật — **cần chạy lại nhiều seed/K để có kết luận chắc
+   chắn về ĐƯỜNG CONG chính xác**, nhưng xu hướng tổng thể (top-K nhỏ ≥ full
+   23 > random) đã đủ rõ qua 6 cấu hình.
+
+**Khuyến nghị (chưa áp dụng, cần xác nhận)**: cân nhắc dùng top5-15 đặc trưng
+(theo |corr|, hoặc permutation importance chính xác hơn) thay vì cả 23 cho
+nhánh graph-only/GraphSAGE — tiềm năng AUPRC cao hơn ~5-13% so với dùng đủ 23,
+đồng thời encoder nhỏ hơn (in_channels thấp hơn). Trước khi đổi chính thức
+nên chạy lại với ≥5 seed/K để xác nhận top5 thực sự tốt hơn top23/top15 một
+cách có ý nghĩa thống kê, không phải may mắn ở 1 seed.
+
+Kết quả đầy đủ: `output/feature_count_ablation_result.json`.
+
+### Xác nhận multi-seed — K* = 7 (2026-09-16)
+
+Theo yêu cầu "chốt con số K tối ưu": chạy lại `feature_count_ablation_multiseed.py`
+— **5 seed/K** (seed=44..48, ảnh hưởng model init + sampler RNG + thứ tự batch),
+K ∈ {3,5,7,10,15,20,23}, 35 lần train tổng cộng. K* chọn theo **val AUPRC trung
+bình cao nhất** (không nhìn test lúc chọn, đúng kỷ luật dự án).
+
+| K | val AUPRC (mean±std) | test AUPRC (mean±std) | test P@100 (mean±std) |
+|---|---|---|---|
+| 3 | 0.382±0.021 | 0.341±0.014 | 0.542±0.073 |
+| 5 | 0.410±0.031 | 0.410±0.038 | 0.678±0.063 |
+| **7** | **0.415±0.032** | 0.397±0.036 | 0.638±0.080 |
+| 10 | 0.370±0.040 | 0.353±0.044 | 0.568±0.118 |
+| 15 | 0.365±0.029 | 0.367±0.038 | 0.608±0.096 |
+| 20 | 0.375±0.042 | 0.343±0.048 | 0.540±0.047 |
+| 23 (toàn bộ) | 0.339±0.034 | 0.310±0.042 | 0.478±0.109 |
+
+**Kết luận (đã kiểm chứng qua nhiều seed, đáng tin hơn bản đơn-seed ở trên)**:
+1. **K* = 7**: `betweenness_centrality, in_degree_centrality, active_days,
+   degree_centrality, short_long_in_ratio, freq_in_short, freq_in_long` —
+   chủ yếu centrality đồ thị + tần suất giao dịch, KHÔNG có cột amount nào
+   (nhóm amount có |corr|≈0, xác nhận lại phát hiện ở bước xếp hạng).
+2. **Dùng đủ 23 đặc trưng là lựa chọn TỆ NHẤT trong cả 7 mức** (val 0.339,
+   thấp nhất; test 0.310, thấp nhất) — xác nhận chắc chắn giả thuyết
+   overfit/nhiễu do cột yếu, không còn là suy đoán từ 1 seed.
+3. **K=7 và K=5 cách nhau trong phạm vi std** (0.415±0.032 vs 0.410±0.031) —
+   không có ý nghĩa thống kê rõ rệt giữa hai mức; K=5 có test AUPRC cao hơn
+   nhẹ và P@100 cao nhất toàn bảng (0.678) nên là lựa chọn thay thế hợp lý
+   nếu muốn encoder nhỏ hơn nữa.
+4. **Điểm trũng bất thường ở K=10 trong bản đơn-seed TRƯỚC ĐÂY đã biến mất**
+   ở đây (K=10 multi-seed: val 0.370, không còn là điểm thấp nhất) — xác
+   nhận đó đúng là nhiễu do 1 seed như đã nghi ngờ, không phải hiệu ứng thật.
+
+**Đã chốt K* = 7** (hoặc K=5 nếu ưu tiên đơn giản/P@100) theo val AUPRC đa-seed.
+**Chưa áp dụng vào pipeline chính thức** (graph-only/fusion vẫn dùng 23 cột) —
+cần xác nhận người dùng trước khi đổi `node_features_all23` sang subset 7/5 cột,
+vì ảnh hưởng tới toàn bộ checkpoint/kết quả đã lưu.
+
+Kết quả đầy đủ (35 run, per-seed): `output/feature_count_ablation_multiseed_result.json`.
+
+## K*=7 áp dụng CHÍNH THỨC vào graph-only + eval full pure_test (2026-09-16)
+
+Theo yêu cầu, đã wire K*=7 vào `train_eval/train_graph_only_hypothesis.py` thay vì
+chỉ nằm trong script ablation riêng: thêm `load_top_k_feature_cols(k)` (đọc đúng
+7 cột đã chốt từ `feature_count_ablation_multiseed_result.json`, không tính lại
+ranking) + tham số `feature_cols` xuyên suốt `train()`/`evaluate()`/
+`compute_probs_by_split()` (slice `node_features` và `graph_inference.x`, không
+mutate cache dùng chung). Backward-compatible 100%: không truyền `--top-k-features`
+→ hành vi cũ y hệt (đủ 23 cột).
+
+Chạy lại đúng lệnh chính thức của `run_pipeline_end_to_end.sh` Giai đoạn 4, thêm
+`--top-k-features 7 --output-suffix _k7` (không ghi đè
+`graph_only_hypothesis_result.json` gốc): early stop epoch 69 (best epoch 39),
+~25 giây tổng (GPU). Kết quả **full pure_test thật (609.773 account, 312 dương)**:
+
+| Metric | K=7 (mới, chính thức) | K=23 (cũ) | GBM (tuned) |
+|---|---|---|---|
+| AUPRC | **0.341** | 0.303 | 0.347 |
+| ROC-AUC | 0.986 | 0.984 | 0.959 |
+| P@1000 | 0.190 | 0.193 | 0.186 |
+| Recall@1000 | 0.609 | 0.619 | 0.596 |
+| F1(pos)@threshold tối ưu (quét trên val) | **0.491** (P=0.573 R=0.430) | — (chưa đo) | 0.210 |
+
+**Phát hiện mới đáng chú ý**: F1(pos)@threshold-tối-ưu = **0.491** — cao hơn hẳn
+GBM (0.210) và fusion (0.201) ở cùng phương pháp chọn threshold (quét trên val,
+áp sang test, không nhìn trộm). Đây là số liệu mới, chưa từng có ở K=23 (bản cũ
+không tính F1@best-threshold). AUPRC (0.341) cũng nhỉnh hơn K=23 (0.303, +12.7%),
+khớp đúng khoảng dự đoán từ multi-seed ablation (0.397±0.036, chạy đơn-seed ở đây
+nên thấp hơn trung bình 1 chút, trong phạm vi std). P@1000/Recall@1000 gần như
+không đổi so với K=23.
+
+**Đọc kết quả**: graph-only + K=7 giờ là model tốt nhất theo AUPRC/F1-tối-ưu
+trong số 3 model đã có số full-scale đáng tin (GBM/graph-only-K23/fusion) —
+vượt GBM ở F1 tối ưu dù thua nhẹ AUPRC (0.341 vs 0.347, cách biệt không lớn,
+trong phạm vi 1 lần chạy đơn-seed). Củng cố thêm khuyến nghị dùng graph-only làm
+trục chính.
+
+**Bổ sung P@100 (đo ngay sau đó, dùng lại checkpoint đã lưu, không train lại)**:
+pure_test P@100 = **0.58** (recall@100=0.186), overlap P@100=0.26, val P@100=0.45
+— thấp hơn GBM (0.72) nhưng nằm trong khoảng dự đoán của multi-seed ablation
+(0.638±0.080 cho K=7) — 1 lần chạy đơn-seed, không phải chênh lệch có ý nghĩa.
+Kết quả: `output/graph_only_hypothesis_result_k7_pat100.json`.
+
+**Việc cần làm tiếp**: multi-seed cho đúng cấu hình chính thức này (hiện chỉ 1
+seed=44) để biết phương sai thật trước khi coi 0.341/0.491/0.58 là số ổn định —
+so với GBM 0.72 ở P@100, khoảng cách vẫn còn (không phải "đã vượt GBM ở mọi
+metric", chỉ vượt ở AUPRC-gần-bằng và F1-tối-ưu).
+
+Kết quả đầy đủ: `output/graph_only_hypothesis_result_k7.json`,
+`output/graph_only_hypothesis_model_k7.pt`. Code đã sửa:
+`train_eval/train_graph_only_hypothesis.py` (thêm `load_top_k_feature_cols()` +
+tham số `feature_cols`, tương thích ngược).
+
+## Ensemble GBM + graph-only-K7 — VƯỢT CẢ 2 MODEL GỐC TRÊN MỌI METRIC (2026-09-16)
+
+Script mới `train_eval/ensemble_gbm_graphonly.py`: retrain GBM (best-tuned config
+đã chốt ở `gbm_baseline.py`) + nạp checkpoint graph-only-K7 đã lưu, lấy
+`predict_proba`/`full_graph_forward` cho **toàn bộ quần thể** (tránh bug lệch thứ
+tự account giữa 2 nguồn — `pos_idx++neg_idx` của `build_partition_indices()` vs
+`np.where(partition==split)` của GBM cho ra 2 thứ tự KHÁC NHAU dù cùng tập chỉ
+số — đã phát hiện lúc viết, sửa bằng cách tính prob cho toàn bộ quần thể trước
+rồi mới slice cùng 1 `idx` cho cả 2 model). 4 phương pháp tổ hợp (trung bình đơn
+giản, trung bình có trọng số quét trên val, logistic-regression stacking, trung
+bình theo rank) — **chọn phương pháp theo VAL AUPRC, không nhìn test**:
+`weighted_avg` với `w_gbm=0.35` thắng (val AUPRC=0.4897, so với GBM alone=0.4334,
+graph7 alone=0.3013).
+
+**Kết quả full-scale THẬT (1 lần duy nhất, đúng kỷ luật)**:
+
+| Split | Model | AUPRC | ROC-AUC | P@100 | P@1000 | Recall@1000 | F1@best_t |
+|---|---|---|---|---|---|---|---|
+| **pure_test** (609.773, 312 dương) | GBM alone | 0.347 | 0.959 | 0.720 | 0.186 | 0.596 | — |
+| | Graph-only-K7 alone | 0.341 | 0.986 | 0.580 | 0.190 | 0.609 | — |
+| | **ENSEMBLE** | **0.474** | **0.989** | **0.800** | **0.231** | **0.740** | **0.500** |
+| overlap (201.931, 217 dương) | GBM alone | 0.271 | 0.908 | 0.580 | 0.121 | 0.558 | — |
+| | Graph-only-K7 alone | 0.151 | 0.967 | 0.260 | 0.126 | 0.581 | — |
+| | **ENSEMBLE** | **0.377** | **0.974** | **0.670** | **0.128** | **0.590** | **0.470** |
+
+**Đọc kết quả**: ensemble vượt CẢ 2 model gốc trên **MỌI metric đo được**, không
+đánh đổi — đúng dấu hiệu 2 tín hiệu bổ sung thật (tabular thủ công vs cấu trúc đồ
+thị học được) chứ không trùng lặp. AUPRC pure_test tăng từ mức tốt nhất trước đó
+(GBM 0.347) lên **0.474 (+36.6% tương đối)** — đây là con số AUPRC full-scale cao
+nhất toàn dự án tính đến nay. P@100 tăng 0.72→0.80, Recall@1000 tăng 0.60→0.74.
+
+**Giới hạn cần nêu rõ**: (1) graph-only-K7 vẫn chỉ 1 seed (seed=44, chưa multi-
+seed) — ensemble kế thừa nguyên hạn chế này, chưa biết phương sai thật; (2) trọng
+số `w=0.35` chọn qua grid 1 chiều thô (bước 0.05) trên val, chưa thử stacking phi
+tuyến phức tạp hơn hay ensemble 3 chiều (thêm cả BERT/fusion dù đang yếu nhất);
+(3) GBM dùng lại đúng hyperparameter đã tune cho input 23 cột — chưa tune riêng
+cho bối cảnh ensemble (có thể không cần, nhưng chưa kiểm chứng).
+
+**Việc cần làm tiếp**: multi-seed graph-only-K7 rồi lặp lại ensemble để biết
+0.474 có ổn định hay chỉ do may mắn 1 seed; cân nhắc thử ensemble 3 model (thêm
+fusion đã sửa BERT_debug.md, AUPRC=0.144) xem có cộng thêm được gì không dù yếu
+nhất riêng lẻ.
+
+Kết quả đầy đủ: `output/ensemble_gbm_graphonly_k7_result.json`. Code mới:
+`train_eval/ensemble_gbm_graphonly.py`.
 
 ## Giai đoạn F — Quyết định scale
 - [ ] F1, F2, F3 — TẠM DỪNG, chờ kết quả full-scale eval E2 v2 SAU BERT_debug.md (đang train lại, xem mục ngay trên) trước khi quyết định

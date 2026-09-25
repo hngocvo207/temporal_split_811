@@ -1,0 +1,150 @@
+{
+  "train_partition": "OLD (Dataset_MG, T_cutoff=1527988904)",
+  "n_train_accounts": 1945607,
+  "per_column": {
+    "out_degree": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "in_degree": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "direction_ratio": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "max_out_amount": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "min_out_amount": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "avg_out_amount": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "max_in_amount": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "min_in_amount": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "avg_in_amount": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "account_balance": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "lifetime_days": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "active_days": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "freq_out_short": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "freq_in_short": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "freq_out_long": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "freq_in_long": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "short_long_out_ratio": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    },
+    "short_long_in_ratio": {
+      "n_train_accounts_differing": 0,
+      "pct_train_accounts_differing": 0.0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "mean_rel_diff_where_full_nonzero_pct": 0.0,
+      "max_rel_diff_pct": 0.0
+    }
+  }
+}
